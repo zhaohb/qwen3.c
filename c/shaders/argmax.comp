@@ -1,0 +1,46 @@
+#version 450
+// Device-side argmax over a logit vector, so greedy decode never ships a whole vocabulary
+// row back to the host: lm_head writes its logits into device-only memory and this kernel
+// reduces them to one (index, value) pair that costs 8 bytes to read back.
+//
+// Two dispatches of the same kernel: stage 0 has `ngrp` workgroups grid-stride the vector
+// into `ngrp` partial winners, stage 1 has workgroup 0 reduce those partials in place.
+// Ties resolve to the LOWEST index so the result matches the host's ascending
+// `if (logit[i] > best)` scan bit for bit.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Y  { float y[]; };     // [N] logits (stage 0 input)
+layout(std430, binding = 1) buffer PI { uint  pidx[]; };           // [ngrp] partial winners
+layout(std430, binding = 2) buffer PV { float pval[]; };
+
+layout(push_constant) uniform P { int N, stage, ngrp; } p;
+
+shared float sv[256];
+shared uint  si[256];
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x), g = int(gl_WorkGroupID.x);
+    float bv = -1.0 / 0.0;
+    uint  bi = 0u;
+    if (p.stage == 0) {
+        for (int i = g * 256 + tid; i < p.N; i += p.ngrp * 256) {
+            float v = y[i];
+            if (v > bv || (v == bv && uint(i) < bi)) { bv = v; bi = uint(i); }
+        }
+    } else {
+        for (int i = tid; i < p.ngrp; i += 256) {
+            float v = pval[i]; uint ix = pidx[i];
+            if (v > bv || (v == bv && ix < bi)) { bv = v; bi = ix; }
+        }
+    }
+    sv[tid] = bv; si[tid] = bi;
+    barrier();
+    for (int k = 128; k > 0; k >>= 1) {
+        if (tid < k) {
+            float v = sv[tid + k]; uint ix = si[tid + k];
+            if (v > sv[tid] || (v == sv[tid] && ix < si[tid])) { sv[tid] = v; si[tid] = ix; }
+        }
+        barrier();
+    }
+    if (tid == 0) { pval[g] = sv[0]; pidx[g] = si[0]; }
+}

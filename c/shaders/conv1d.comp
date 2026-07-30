@@ -1,0 +1,21 @@
+#version 450
+// Causal depthwise conv1d + SiLU (qwen.c gdn_step conv loop):
+//   cv[ch] = silu( sum_j w[ch*K + j] * ring[j*CD + ch] )
+// ring is the K-slot per-channel history (slot K-1 = newest), CD channels; each
+// channel is an independent length-K FIR (depthwise), no bias. One thread/channel.
+// Analogous to llama.cpp ssm_conv.comp (per-channel causal conv over a small window).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer RING { float ring[]; };   // [K, CD]
+layout(std430, binding = 1) readonly  buffer W    { float cw[]; };     // [CD, K]
+layout(std430, binding = 2) writeonly buffer OUT  { float cv[]; };     // [CD]
+
+layout(push_constant) uniform P { int CD, K; } p;
+
+void main() {
+    uint ch = gl_GlobalInvocationID.x;
+    if (ch >= uint(p.CD)) return;
+    float acc = 0.0;
+    for (int j = 0; j < p.K; j++) acc += cw[ch * uint(p.K) + uint(j)] * ring[uint(j) * uint(p.CD) + ch];
+    cv[ch] = acc / (1.0 + exp(-acc));   // SiLU
+}

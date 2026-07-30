@@ -1,0 +1,27 @@
+#version 450
+// Causal depthwise conv1d + SiLU with a DEVICE-resident ring (GDN input block).
+// ring holds the previous K tokens per channel (slot K-1 = newest-previous). Each token:
+// shift the ring (drop oldest), append this token's qkv, convolve over the K taps, SiLU,
+// and write the shifted+appended ring back — so the ring persists across decode steps on
+// the device (no host round-trip). One thread per channel. Matches qwen.c gdn_step conv.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer QKV  { float qkv[]; };   // [CD] this token
+layout(std430, binding = 1) readonly  buffer W    { float cw[]; };    // [CD, K]
+layout(std430, binding = 2)           buffer RING { float ring[]; };  // [K, CD] persistent (rw)
+layout(std430, binding = 3) writeonly buffer CV   { float cv[]; };    // [CD] conv output
+
+layout(push_constant) uniform P { int CD, K; } p;
+
+void main() {
+    uint ch = gl_GlobalInvocationID.x;
+    if (ch >= uint(p.CD)) return;
+    int K = p.K, CD = p.CD, c = int(ch);
+    float slots[16];                                  // K <= 16
+    for (int j = 0; j < K - 1; j++) slots[j] = ring[(j + 1) * CD + c];  // shift out the oldest
+    slots[K - 1] = qkv[c];                            // append newest
+    float acc = 0.0;
+    for (int j = 0; j < K; j++) acc += cw[c * K + j] * slots[j];
+    cv[c] = acc / (1.0 + exp(-acc));                  // SiLU
+    for (int j = 0; j < K; j++) ring[j * CD + c] = slots[j];            // persist shifted ring
+}

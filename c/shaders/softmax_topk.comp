@@ -1,0 +1,72 @@
+#version 450
+// Softmax over router logits then greedy top-K without replacement, matching
+// qwen.c's host path: softmax_row → K×(argmax with strict >) → renorm.
+// One workgroup; E must be <= 256 (Qwen3.5/3.6-MoE). Ties keep the lower index.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer L   { float logits[]; };
+layout(std430, binding = 1) writeonly buffer IDX { int idx[]; };
+layout(std430, binding = 2) buffer VAL { float val[]; }; /* read-write: filled then renormed */
+
+layout(push_constant) uniform PC { int E, K, base; } p; /* base: idx/val offset for ping-pong */
+
+shared float s_work[256];
+shared float s_red[256];
+shared int   s_imax[256];
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    float x = (tid < p.E) ? logits[tid] : -3.402823e38;
+
+    /* softmax max */
+    s_red[tid] = x;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) s_red[tid] = max(s_red[tid], s_red[tid + off]);
+        barrier();
+    }
+    float mx = s_red[0];
+    float ex = (tid < p.E) ? exp(x - mx) : 0.0;
+    s_red[tid] = ex;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) s_red[tid] += s_red[tid + off];
+        barrier();
+    }
+    float prob = (tid < p.E) ? (ex / s_red[0]) : -1.0;
+    s_work[tid] = prob;
+    barrier();
+
+    for (int k = 0; k < p.K; k++) {
+        s_red[tid] = s_work[tid];
+        s_imax[tid] = (tid < p.E) ? tid : 0x7fffffff;
+        barrier();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) {
+                float a = s_red[tid], b = s_red[tid + off];
+                int ia = s_imax[tid], ib = s_imax[tid + off];
+                /* strict > like the host; equal → lower index */
+                if (b > a || (b == a && ib < ia)) {
+                    s_red[tid] = b;
+                    s_imax[tid] = ib;
+                }
+            }
+            barrier();
+        }
+        if (tid == 0) {
+            idx[p.base + k] = s_imax[0];
+            val[p.base + k] = s_red[0];
+        }
+        barrier();
+        int winner = s_imax[0];
+        if (tid == winner) s_work[tid] = -1.0;
+        barrier();
+    }
+
+    if (tid == 0) {
+        float sm = 0.0;
+        for (int k = 0; k < p.K; k++) sm += val[p.base + k];
+        float inv = (sm > 0.0) ? (1.0 / sm) : 0.0;
+        for (int k = 0; k < p.K; k++) val[p.base + k] *= inv;
+    }
+}

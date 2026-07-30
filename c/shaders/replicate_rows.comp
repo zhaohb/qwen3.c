@@ -1,0 +1,16 @@
+#version 450
+// Pack the single post-norm activation row into expert_group's x buffer:
+//   eg_x[c*D + d] = nrm[d]  for c in [0, count).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer NRM { float nrm[]; };
+layout(std430, binding = 1) writeonly buffer X   { float x[]; };
+
+layout(push_constant) uniform PC { int count, D; } p;
+
+void main() {
+    int d = int(gl_GlobalInvocationID.x);
+    if (d >= p.D) return;
+    float v = nrm[d];
+    for (int c = 0; c < p.count; c++) x[c * p.D + d] = v;
+}

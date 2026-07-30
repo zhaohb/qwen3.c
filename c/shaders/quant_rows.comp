@@ -1,0 +1,42 @@
+#version 450
+// Per-row int8 quantization of the expert hidden activations. The gate+up phase leaves
+// hidden in float on the device, but the down projection wants an int8 activation to feed
+// DP4A -- and the row amax needed for the scale spans outputs that phase 1 splits across
+// workgroups, so it cannot be folded in there. One workgroup per row: shared-memory amax
+// reduction, then scale + round + pack 4 int8 per uint.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer H  { float h[]; };   // [S, I]
+layout(std430, binding = 1) writeonly buffer HQ { uint hq[]; };   // int8, 4/uint [S, I/4]
+layout(std430, binding = 2) writeonly buffer HS { float hs[]; };  // per-row scale [S]
+
+layout(push_constant) uniform P { int S, I; } p;
+
+shared float amx[256];
+
+void main() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    if (s >= p.S) return;               // uniform across the workgroup -> barriers stay matched
+    int base = s * p.I;
+    float m = 0.0;
+    for (int i = tid; i < p.I; i += 256) m = max(m, abs(h[base + i]));
+    amx[tid] = m;
+    barrier();
+    for (int k = 128; k > 0; k >>= 1) {
+        if (tid < k) amx[tid] = max(amx[tid], amx[tid + k]);
+        barrier();
+    }
+    float sc = amx[0] > 0.0 ? amx[0] / 127.0 : 1.0;
+    if (tid == 0) hs[s] = sc;
+    float inv = 1.0 / sc;
+    int words = (p.I + 3) / 4;
+    for (int w = tid; w < words; w += 256) {
+        uint packed = 0u;
+        for (int k = 0; k < 4; k++) {
+            int i = w * 4 + k;
+            int q = i < p.I ? clamp(int(round(h[base + i] * inv)), -127, 127) : 0;
+            packed |= (uint(q) & 0xffu) << (8 * k);
+        }
+        hq[s * words + w] = packed;
+    }
+}

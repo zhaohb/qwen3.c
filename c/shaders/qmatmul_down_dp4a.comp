@@ -1,0 +1,52 @@
+#version 450
+// Down projection for grouped-asymmetric int4 experts (fmt=6) via DP4A -- the phase-2
+// counterpart of qmatmul_gate_up_dp4a.comp. Consumes the int8 hidden that quant_rows.comp
+// produced, so the activation scale is per row rather than per group. Per group g:
+//   contrib = scale_g*(Sum hq*nibble - zero_g*Sum hq),   y = hs[row] * Sum_g contrib
+// sc holds interleaved [scale_g, zero_g] pairs (O*ng*2); nibbles are raw fmt=6 values 0..15.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_integer_dot_product : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer HQ { uint hq[]; };   // int8 activation, 4/uint [S, I/4]
+layout(std430, binding = 1) readonly  buffer HS { float hs[]; };  // per-row activation scale
+layout(std430, binding = 2) readonly  buffer W  { uint w[]; };    // int4 weights
+layout(std430, binding = 3) readonly  buffer SC { float sc[]; };  // [O*ng*2] scale,zero
+layout(std430, binding = 4) writeonly buffer Y  { float y[]; };   // [S, O]
+
+// HQ/HS are bound whole -- per-expert slices would have to respect
+// minStorageBufferOffsetAlignment, which a 4B-granular row scale cannot -- so sbase
+// selects this expert's first row instead. Only Y stays a slice.
+layout(push_constant) uniform P { int S, I, O, rowWords, gs, sbase; } p;
+
+shared uint xsh[2048];   // int8 activation, 4/uint (I <= 8192)
+
+int pkn(uint v) {        // 4 low nibbles of v -> packed int8 (values 0..15)
+    return int((v & 0xfu) | (((v >> 4) & 0xfu) << 8) | (((v >> 8) & 0xfu) << 16) | (((v >> 12) & 0xfu) << 24));
+}
+
+void main() {
+    int s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x), xwords = (p.I + 3) / 4;
+    int row = p.sbase + s;
+    for (int i = tid; i < xwords; i += 256) xsh[i] = hq[row * xwords + i];
+    barrier();
+    int lane = int(gl_SubgroupInvocationID), sgsize = int(gl_SubgroupSize);
+    int sg = int(gl_SubgroupID), nsg = 256 / sgsize, stride = int(gl_NumWorkGroups.x) * nsg;
+    int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+    float xscale = hs[row];
+    const int ONES = 0x01010101;
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
+        uint rb = uint(o) * uint(p.rowWords), sb = uint(o) * uint(ng) * 2u;
+        float acc = 0.0;
+        for (int wi = lane; wi < words; wi += sgsize) {
+            uint xu0 = xsh[2 * wi], xu1 = xsh[2 * wi + 1];
+            uint b = w[rb + uint(wi)];
+            int awn = dotPacked4x8EXT(int(xu0), pkn(b)) + dotPacked4x8EXT(int(xu1), pkn(b >> 16));
+            int ax  = dotPacked4x8EXT(int(xu0), ONES) + dotPacked4x8EXT(int(xu1), ONES);
+            uint grp = uint(wi * 8 / p.gs) * 2u;
+            acc += sc[sb + grp] * (float(awn) - sc[sb + grp + 1u] * float(ax));
+        }
+        float tot = subgroupAdd(acc);
+        if (lane == 0) y[s * p.O + o] = tot * xscale;
+    }
+}

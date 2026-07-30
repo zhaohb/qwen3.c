@@ -1,0 +1,28 @@
+#version 450
+/* Pack MoE mix weights: moe_w[0..K) = val[0..K); optional shared
+ * moe_w[K] = sigmoid(dot(sh_gate, nrm)). Single workgroup. */
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Val { float val[]; };
+layout(std430, binding = 1) readonly buffer Nrm { float nrm[]; };
+layout(std430, binding = 2) readonly buffer ShG { float sh_gate[]; };
+layout(std430, binding = 3) writeonly buffer W { float moe_w[]; };
+
+layout(push_constant) uniform PC { int K, D, do_shared, base; } p;
+
+shared float red[256];
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    if (tid < p.K) moe_w[tid] = val[p.base + tid];
+    if (p.do_shared == 0) return;
+    float partial = 0.0;
+    for (int i = tid; i < p.D; i += 256) partial += sh_gate[i] * nrm[i];
+    red[tid] = partial;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        barrier();
+    }
+    if (tid == 0) moe_w[p.K] = 1.0 / (1.0 + exp(-red[0]));
+}

@@ -1,0 +1,119 @@
+#version 450
+/* Indexed MoE expert MLP, fmt=6 (GPTQ) only.
+ * WorkGroupID.y = expert slot (0..K-1 routed, K = shared if do_shared).
+ * WorkGroupID.x = row-group (same grid as qmatmul_gate_up / qmatmul).
+ * mode 0: nrm -> h[slot*I + o] via gate+up+silu
+ * mode 1: h -> y[slot*D + o] via down
+ * Descriptor arrays are laid out [layer*(E+1) + eid]; shared expert at eid=E.
+ */
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Nrm { float nrm[]; };
+layout(std430, binding = 1) readonly buffer Idx { int idx[]; };
+layout(std430, binding = 2) readonly buffer Val { float val[]; }; /* unused here; host/macc */
+layout(std430, binding = 3) readonly buffer ShGate { float sh_gate[]; };
+layout(std430, binding = 4) readonly buffer Valid { uint valid[]; };
+layout(std430, binding = 5) buffer H { float h[]; };   /* [nslot, I] */
+layout(std430, binding = 6) buffer Y { float y[]; };   /* [nslot, D] */
+
+layout(std430, binding = 7)  readonly buffer GW { uint data[]; } gw[];
+layout(std430, binding = 8)  readonly buffer GS { float data[]; } gs[];
+layout(std430, binding = 9)  readonly buffer UW { uint data[]; } uw[];
+layout(std430, binding = 10) readonly buffer US { float data[]; } us[];
+layout(std430, binding = 11) readonly buffer DW { uint data[]; } dw[];
+layout(std430, binding = 12) readonly buffer DS { float data[]; } ds[];
+
+layout(push_constant) uniform PC {
+    int mode;       /* 0=gate_up, 1=down */
+    int K, D, I, E, base; /* base = layer*(E+1) into descriptor arrays */
+    int rowWords_g, rowWords_d, gs, do_shared;
+    int ibase;      /* offset into idx/val for ping-pong slot */
+} p;
+
+shared float xsh[6144];
+shared float red[256];
+
+float i4(uint w, int l) { return float(int((w >> (uint(l) * 4u)) & 0xfu) - 8); }
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    int nth = int(gl_WorkGroupSize.x);
+    int slot = int(gl_WorkGroupID.y);
+    int nslot = p.K + p.do_shared;
+    if (slot >= nslot) return;
+
+    int is_shared = (slot == p.K) ? 1 : 0;
+    int eid = is_shared != 0 ? p.E : idx[p.ibase + slot];
+    int di = p.base + eid;
+    if (di < 0 || valid[di] == 0u) return;
+
+    int lane = int(gl_SubgroupInvocationID);
+    int sgsize = int(gl_SubgroupSize);
+    int sg = int(gl_SubgroupID);
+    int nsg = nth / sgsize;
+    int stride = int(gl_NumWorkGroups.x) * nsg;
+
+    if (p.mode == 0) {
+        for (int i = tid; i < p.D; i += nth) xsh[i] = nrm[i];
+        barrier();
+        for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.I; o += stride) {
+            uint rb = uint(o) * uint(p.rowWords_g);
+            int words = (p.D + 7) / 8, ng = (p.D + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng) * 2u;
+            float g = 0.0, u = 0.0;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint gp = gw[nonuniformEXT(di)].data[rb + uint(wi)];
+                uint upk = uw[nonuniformEXT(di)].data[rb + uint(wi)];
+                int i0 = wi * 8;
+                uint grp = uint(i0 / p.gs);
+                float gs_ = gs[nonuniformEXT(di)].data[sb + grp * 2u];
+                float gz  = gs[nonuniformEXT(di)].data[sb + grp * 2u + 1u];
+                float us_ = us[nonuniformEXT(di)].data[sb + grp * 2u];
+                float uz  = us[nonuniformEXT(di)].data[sb + grp * 2u + 1u];
+                float gawn = 0.0, uawn = 0.0, ax = 0.0;
+                for (int k = 0; k < 8; k++) {
+                    int i = i0 + k;
+                    if (i < p.D) {
+                        float xv = xsh[i];
+                        gawn += xv * (i4(gp, k) + 8.0);
+                        uawn += xv * (i4(upk, k) + 8.0);
+                        ax += xv;
+                    }
+                }
+                g += gs_ * (gawn - gz * ax);
+                u += us_ * (uawn - uz * ax);
+            }
+            float gt = subgroupAdd(g), ut = subgroupAdd(u);
+            if (lane == 0) h[slot * p.I + o] = (gt / (1.0 + exp(-gt))) * ut;
+        }
+        return;
+    }
+
+    /* mode 1: down */
+    for (int i = tid; i < p.I; i += nth) xsh[i] = h[slot * p.I + i];
+    barrier();
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.D; o += stride) {
+        uint rb = uint(o) * uint(p.rowWords_d);
+        int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+        uint sb = uint(o) * uint(ng) * 2u;
+        float sum = 0.0;
+        for (int wi = lane; wi < words; wi += sgsize) {
+            uint pk = dw[nonuniformEXT(di)].data[rb + uint(wi)];
+            int i0 = wi * 8;
+            uint grp = uint(i0 / p.gs);
+            float sc = ds[nonuniformEXT(di)].data[sb + grp * 2u];
+            float zr = ds[nonuniformEXT(di)].data[sb + grp * 2u + 1u];
+            float awn = 0.0, ax = 0.0;
+            for (int k = 0; k < 8; k++) {
+                int i = i0 + k;
+                if (i < p.I) { float xv = xsh[i]; awn += xv * (i4(pk, k) + 8.0); ax += xv; }
+            }
+            sum += sc * (awn - zr * ax);
+        }
+        float tot = subgroupAdd(sum);
+        if (lane == 0) y[slot * p.D + o] = tot;
+    }
+}

@@ -1,0 +1,40 @@
+#version 450
+// Fuse the post-attention residual add with Qwen's zero-centered RMSNorm so the
+// MoE prep (resid += attn_delta; nrm = rmsnorm_zc(resid, post_ln)) can ride the
+// same submit as the attention/GDN block — no host round-trip between them.
+//   x_out[s] = x[s] + delta[s]
+//   y[s,i]   = x_out[s,i] * rsqrt(mean(x_out[s]^2)+eps) * (1 + w[i])
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer X  { float x[]; };
+layout(std430, binding = 1) readonly  buffer D  { float delta[]; };
+layout(std430, binding = 2) readonly  buffer W  { float w[]; };
+layout(std430, binding = 3) buffer XO { float x_out[]; };   /* read-write: written then re-read for y */
+layout(std430, binding = 4) writeonly buffer Y  { float y[]; };
+
+layout(push_constant) uniform P { int S, D; float eps; } p;
+
+shared float red[256];
+
+void main() {
+    int s = int(gl_WorkGroupID.x);
+    if (s >= p.S) return;
+    int tid = int(gl_LocalInvocationID.x);
+    uint base = uint(s) * uint(p.D);
+
+    float acc = 0.0;
+    for (int i = tid; i < p.D; i += 256) {
+        float v = x[base + uint(i)] + delta[base + uint(i)];
+        x_out[base + uint(i)] = v;
+        acc += v * v;
+    }
+    red[tid] = acc;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        barrier();
+    }
+    float r = 1.0 / sqrt(red[0] / float(p.D) + p.eps);
+    for (int i = tid; i < p.D; i += 256)
+        y[base + uint(i)] = x_out[base + uint(i)] * r * (1.0 + w[i]);
+}

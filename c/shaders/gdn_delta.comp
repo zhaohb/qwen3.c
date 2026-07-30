@@ -1,0 +1,70 @@
+#version 450
+// GatedDeltaNet delta-rule recurrence + gated RMSNorm (decode, S=1), the VK
+// equivalent of the hot loop in qwen.c gdn_step(). Technique from llama.cpp's
+// wkv7.comp (RWKV-7 delta rule): one workgroup per value-head, thread `vd` owns
+// state column vd of the per-head recurrent state S[KD][VD] (row-major), which
+// lives device-resident across tokens.
+//
+// The 7 small inputs are packed into ONE buffer `in[]` (offsets derived from the
+// dims) so the pipeline needs just 3 bindings: in, state, y.
+//   in layout: qn[KH*KD] | kn[KH*KD] | v[VH*VD] | z[VH*VD] | decay[VH] | beta[VH] | gnorm[VD]
+//
+// Per v-head h (source k-head src = h/(VH/KH)):
+//   S[kd][vd] *= decay ; kv_mem[vd] = sum_kd S[kd][vd]*k[kd]
+//   delta[vd] = (v[vd]-kv_mem[vd]) * beta
+//   S[kd][vd] += k[kd]*delta[vd] ; y[vd] = sum_kd S[kd][vd]*q[kd]
+//   y[vd] = y[vd]/sqrt(mean(y^2)+eps) * gnorm[vd] * silu(z[vd])
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 512) in;   // >= VD (VD<=512)
+
+layout(std430, binding = 0) readonly buffer IN { float in_[]; };   // packed inputs
+layout(std430, binding = 1)          buffer ST { float state[]; }; // [VH*KD*VD] persistent
+layout(std430, binding = 2) writeonly buffer YB { float y[]; };    // [VH*VD]
+
+layout(push_constant) uniform P { uint KH, KD, VH, VD; float eps; } p;
+
+shared float red[512];
+
+void main() {
+    uint h  = gl_WorkGroupID.x;
+    uint vd = gl_LocalInvocationID.x;
+    if (h >= p.VH) return;
+    bool on = vd < p.VD;
+
+    uint QK = p.KH * p.KD, HV = p.VH * p.VD;
+    uint qn_o = 0u, kn_o = QK, v_o = 2u*QK, z_o = 2u*QK + HV;
+    uint dc_o = 2u*QK + 2u*HV, bt_o = dc_o + p.VH, gn_o = bt_o + p.VH;
+
+    uint src   = h / (p.VH / p.KH);
+    uint qbase = qn_o + src * p.KD, kbase = kn_o + src * p.KD;
+    uint vbase = v_o + h * p.VD, zbase = z_o + h * p.VD;
+    uint sbase = h * p.KD * p.VD;
+    float dec = in_[dc_o + h], bta = in_[bt_o + h];
+
+    float yy = 0.0;
+    if (on) {
+        float kvm = 0.0;
+        for (uint kd = 0u; kd < p.KD; ++kd) {
+            uint idx = sbase + kd * p.VD + vd;
+            float sv = state[idx] * dec;
+            state[idx] = sv;
+            kvm += sv * in_[kbase + kd];
+        }
+        float delta = (in_[vbase + vd] - kvm) * bta;
+        for (uint kd = 0u; kd < p.KD; ++kd) {
+            uint idx = sbase + kd * p.VD + vd;
+            float sv = state[idx] + in_[kbase + kd] * delta;
+            state[idx] = sv;
+            yy += sv * in_[qbase + kd];
+        }
+    }
+
+    red[vd] = on ? yy * yy : 0.0;
+    barrier();
+    for (uint o = 256u; o > 0u; o >>= 1) { if (vd < o) red[vd] += red[vd + o]; barrier(); }
+    float r = inversesqrt(red[0] / float(p.VD) + p.eps);
+    if (on) {
+        float g = in_[zbase + vd];
+        y[vbase - v_o + vd] = yy * r * in_[gn_o + vd] * (g / (1.0 + exp(-g)));
+    }
+}

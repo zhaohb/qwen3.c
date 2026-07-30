@@ -1,0 +1,48 @@
+#version 450
+// int8 mat-vec via hardware integer dot product (DP4A) — the quantized-activation path
+// llama.cpp uses in mul_mat_vecq. y[o] = (sum_i xq[i]*w8[o,i]) * xscale * scale[o], with
+// xq the int8-quantized activation (4 packed per uint) and w8 the int8 weight (4/uint).
+// One subgroup per output row, grid-stride, dotPacked4x8AccSatEXT accumulates 4 MACs/inst.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_integer_dot_product : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XQ { uint xq[]; };     // int8 activation, 4/uint [I/4]
+layout(std430, binding = 1) readonly buffer W  { uint w[]; };      // int8 weight,   4/uint [O, I/4]
+layout(std430, binding = 2) readonly buffer SC { float scale[]; }; // per-row weight scale [O]
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };     // [O]
+
+layout(push_constant) uniform P { int I, O; float xscale; int fmt; } p;  // fmt: 1=int8, 2=int4
+
+shared uint xsh[2048];   // int8 activation, 4/uint (I <= 8192)
+
+// pack 4 int4 nibbles (value = nibble-8) into a packed-int8 uint for dp4a
+int pk(uint n0, uint n1, uint n2, uint n3) {
+    return int(((n0 - 8u) & 0xffu) | (((n1 - 8u) & 0xffu) << 8) | (((n2 - 8u) & 0xffu) << 16) | (((n3 - 8u) & 0xffu) << 24));
+}
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x), xwords = (p.I + 3) / 4;
+    for (int i = tid; i < xwords; i += 256) xsh[i] = xq[i];
+    barrier();
+    int lane = int(gl_SubgroupInvocationID), sgsize = int(gl_SubgroupSize);
+    int sg = int(gl_SubgroupID), nsg = 256 / sgsize;
+    int stride = int(gl_NumWorkGroups.x) * nsg;
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
+        int acc = 0;
+        if (p.fmt == 1) {                                  // int8 weights, 4/uint
+            for (int wi = lane; wi < xwords; wi += sgsize)
+                acc += dotPacked4x8EXT(int(xsh[wi]), int(w[o * xwords + wi]));
+        } else {                                           // int4 weights, 8 nibbles/uint -> 2 dp4a
+            int wwords = (p.I + 7) / 8;
+            for (int wi = lane; wi < wwords; wi += sgsize) {
+                uint b = w[o * wwords + wi];
+                int p0 = pk((b) & 0xfu, (b >> 4) & 0xfu, (b >> 8) & 0xfu, (b >> 12) & 0xfu);
+                int p1 = pk((b >> 16) & 0xfu, (b >> 20) & 0xfu, (b >> 24) & 0xfu, (b >> 28) & 0xfu);
+                acc += dotPacked4x8EXT(int(xsh[2 * wi]), p0) + dotPacked4x8EXT(int(xsh[2 * wi + 1]), p1);
+            }
+        }
+        int tot = subgroupAdd(acc);
+        if (lane == 0) y[o] = float(tot) * p.xscale * scale[o];
+    }
+}

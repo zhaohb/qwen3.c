@@ -1,0 +1,69 @@
+#version 450
+// GatedDeltaNet delta-rule + gated RMSNorm reading the RAW conv output `cv` and folding
+// the q/k L2-norm in-shader — the fused-block variant of gdn_delta.comp. cv is the conv1d
+// output laid out [ q(key_dim) | k(key_dim) | v(value_dim) ]; z is the gate; pr packs
+// [decay(VH) | beta(VH) | gnorm(VD)]. One workgroup per value-head (thread = vd).
+// Per value-head h (source k-head src = h/(VH/KH)):
+//   q/k L2-norm of head src:  rq = 1/sqrt(sum q^2 + eps)/sqrt(KD),  rk = 1/sqrt(sum k^2 + eps)
+//   then the same delta-rule + gated RMSNorm as gdn_delta.comp.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 512) in;   // >= VD and >= KD
+
+layout(std430, binding = 0) readonly  buffer CV { float cv[]; };     // [CD]
+layout(std430, binding = 1) readonly  buffer ZB { float z[]; };      // [value_dim]
+layout(std430, binding = 2) readonly  buffer PR { float pr[]; };     // [VH|VH|VD]
+layout(std430, binding = 3)           buffer ST { float state[]; };  // [VH*KD*VD] persistent
+layout(std430, binding = 4) writeonly buffer YB { float y[]; };      // [VH*VD]
+
+layout(push_constant) uniform P { uint KH, KD, VH, VD, key_dim; float eps; } p;
+
+shared float red[512];
+shared float qn[256];            // normalized q/k of this workgroup's source head (KD <= 256)
+shared float kn[256];
+
+void main() {
+    uint h  = gl_WorkGroupID.x;
+    uint vd = gl_LocalInvocationID.x;
+    if (h >= p.VH) return;
+    bool on = vd < p.VD;
+    uint src = h / (p.VH / p.KH);
+
+    /* q/k L2-norm for source head src (two reductions over KD) */
+    float sq = 0.0, sk = 0.0;
+    for (uint d = vd; d < p.KD; d += 512u) {
+        float qq = cv[src * p.KD + d], kk = cv[p.key_dim + src * p.KD + d];
+        sq += qq * qq; sk += kk * kk;
+    }
+    red[vd] = sq; barrier();
+    for (uint o = 256u; o > 0u; o >>= 1) { if (vd < o) red[vd] += red[vd + o]; barrier(); }
+    float rq = inversesqrt(red[0] + p.eps) * inversesqrt(float(p.KD));
+    barrier();
+    red[vd] = sk; barrier();
+    for (uint o = 256u; o > 0u; o >>= 1) { if (vd < o) red[vd] += red[vd + o]; barrier(); }
+    float rk = inversesqrt(red[0] + p.eps);
+    barrier();
+    for (uint d = vd; d < p.KD; d += 512u) {
+        qn[d] = cv[src * p.KD + d] * rq;
+        kn[d] = cv[p.key_dim + src * p.KD + d] * rk;
+    }
+    barrier();
+
+    /* delta rule + gated RMSNorm (thread vd owns state column vd) */
+    uint vbase = 2u * p.key_dim + h * p.VD;   // v part of cv for value-head h
+    uint sbase = h * p.KD * p.VD;
+    float dec = pr[h], bta = pr[p.VH + h];
+    float yy = 0.0;
+    if (on) {
+        float kvm = 0.0;
+        for (uint kd = 0u; kd < p.KD; ++kd) { uint idx = sbase + kd * p.VD + vd; float sv = state[idx] * dec; state[idx] = sv; kvm += sv * kn[kd]; }
+        float delta = (cv[vbase + vd] - kvm) * bta;
+        for (uint kd = 0u; kd < p.KD; ++kd) { uint idx = sbase + kd * p.VD + vd; float sv = state[idx] + kn[kd] * delta; state[idx] = sv; yy += sv * qn[kd]; }
+    }
+    red[vd] = on ? yy * yy : 0.0; barrier();
+    for (uint o = 256u; o > 0u; o >>= 1) { if (vd < o) red[vd] += red[vd + o]; barrier(); }
+    float r = inversesqrt(red[0] / float(p.VD) + p.eps);
+    if (on) {
+        float g = z[h * p.VD + vd];
+        y[h * p.VD + vd] = yy * r * pr[2u * p.VH + vd] * (g / (1.0 + exp(-g)));
+    }
+}

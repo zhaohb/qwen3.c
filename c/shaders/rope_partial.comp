@@ -1,0 +1,27 @@
+#version 450
+// Partial NeoX RoPE (qwen.c rope_partial): rotate only the first `rot` dims of
+// each head, half-half convention (dims j and j+rot/2 form a pair):
+//   inv = theta^(-2j/rot), ang = pos*inv
+//   x[j]      = lo*cos - hi*sin ;  x[j+rot/2] = hi*cos + lo*sin
+// nh heads packed contiguously, stride hstride floats (attention q packs
+// [q(hd)|gate(hd)] so hstride = 2*hd; k packs [k(hd)] so hstride = hd). Single
+// position `pos` (decode, S=1). Technique mirrors llama.cpp rope_neox.comp.
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer X { float x[]; };
+
+layout(push_constant) uniform P { int nh, hstride, rot, pos; float theta; } p;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= uint(p.nh)) return;
+    int hr = p.rot / 2;
+    uint base = h * uint(p.hstride);
+    for (int j = int(gl_LocalInvocationID.x); j < hr; j += int(gl_WorkGroupSize.x)) {
+        float inv = pow(p.theta, -2.0 * float(j) / float(p.rot));
+        float ang = float(p.pos) * inv, cs = cos(ang), sn = sin(ang);
+        float lo = x[base + uint(j)], hi = x[base + uint(j + hr)];
+        x[base + uint(j)]      = lo * cs - hi * sn;
+        x[base + uint(j + hr)] = hi * cs + lo * sn;
+    }
+}

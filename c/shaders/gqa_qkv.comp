@@ -1,0 +1,66 @@
+#version 450
+// GQA q/k RMSNorm(zero-centered) + partial NeoX RoPE + KV-mirror write, on-device.
+// One workgroup per (query head h = WorkGroupID.x, token s = WorkGroupID.y):
+//   q head:  normalize+rope the q part of qg[s,h] in place (the gate part is untouched).
+//   k head (h < KH): normalize+rope k[s,h] -> write to Kmirror[h*max_t + pos]; copy v -> Vmirror.
+// Matches qwen.c attention(): rmsnorm_zc(out=x*rsqrt(mean(x^2)+eps)*(1+w)) then rope_partial
+// (rot dims, half-half). qg layout [S,H,2*hd] (q|gate); k/v [S,KH,hd]. pos = pos_base + s.
+layout(local_size_x = 256) in;   // >= hd
+
+layout(std430, binding = 0)          buffer QG { float qg[]; };   // [S,H,2*hd] rw (q part normed+roped)
+layout(std430, binding = 1) readonly buffer KB { float k[]; };    // [S,KH,hd]
+layout(std430, binding = 2) readonly buffer VB { float v[]; };    // [S,KH,hd]
+layout(std430, binding = 3) readonly buffer QN { float qnw[]; };  // q_norm weight [hd]
+layout(std430, binding = 4) readonly buffer KN { float knw[]; };  // k_norm weight [hd]
+layout(std430, binding = 5)          buffer KM { float km[]; };   // Kmirror [KH*max_t, hd]
+layout(std430, binding = 6)          buffer VM { float vm[]; };   // Vmirror [KH*max_t, hd]
+
+layout(push_constant) uniform P { int S, H, KH, hd, rot, pos_base, max_t; float eps, theta; } p;
+
+shared float red[256];
+shared float sh[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x, s = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+    if (h >= uint(p.H)) return;
+    bool on = tid < uint(p.hd);
+    int pos = p.pos_base + int(s), hr = p.rot / 2;
+
+    /* --- q head: rmsnorm_zc + partial rope, in place in qg (q part) --- */
+    uint qb = (s * uint(p.H) + h) * 2u * uint(p.hd);
+    float qv = on ? qg[qb + tid] : 0.0;
+    red[tid] = qv * qv; barrier();
+    for (uint o = 128u; o > 0u; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; barrier(); }
+    float rq = inversesqrt(red[0] / float(p.hd) + p.eps);
+    sh[tid] = on ? qv * rq * (1.0 + qnw[tid]) : 0.0;
+    barrier();
+    if (int(tid) < hr) {                       // rope (half-half) in shared
+        float inv = pow(p.theta, -2.0 * float(tid) / float(p.rot));
+        float ang = float(pos) * inv, cs = cos(ang), sn = sin(ang);
+        float lo = sh[tid], hi = sh[uint(hr) + tid];
+        sh[tid] = lo * cs - hi * sn; sh[uint(hr) + tid] = hi * cs + lo * sn;
+    }
+    barrier();
+    if (on) qg[qb + tid] = sh[tid];
+
+    /* --- k head (h < KH): rmsnorm_zc + rope k -> Kmirror; v -> Vmirror --- */
+    if (h < uint(p.KH)) {
+        uint kb = (s * uint(p.KH) + h) * uint(p.hd);
+        uint mrow = (h * uint(p.max_t) + uint(pos)) * uint(p.hd);
+        float kv = on ? k[kb + tid] : 0.0;
+        barrier();
+        red[tid] = kv * kv; barrier();
+        for (uint o = 128u; o > 0u; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; barrier(); }
+        float rk = inversesqrt(red[0] / float(p.hd) + p.eps);
+        sh[tid] = on ? kv * rk * (1.0 + knw[tid]) : 0.0;
+        barrier();
+        if (int(tid) < hr) {
+            float inv = pow(p.theta, -2.0 * float(tid) / float(p.rot));
+            float ang = float(pos) * inv, cs = cos(ang), sn = sin(ang);
+            float lo = sh[tid], hi = sh[uint(hr) + tid];
+            sh[tid] = lo * cs - hi * sn; sh[uint(hr) + tid] = hi * cs + lo * sn;
+        }
+        barrier();
+        if (on) { km[mrow + tid] = sh[tid]; vm[mrow + tid] = v[kb + tid]; }
+    }
+}

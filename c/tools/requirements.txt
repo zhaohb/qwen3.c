@@ -1,0 +1,8 @@
+# Python deps for converters / tiny oracle
+safetensors>=0.4
+numpy>=1.26
+
+# Optional (make_tiny_qwen.py, HF download helpers):
+# torch>=2.4
+# transformers>=5.11
+# huggingface-hub>=0.24

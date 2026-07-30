@@ -1,0 +1,59 @@
+#version 450
+// Fused gate+up+SiLU for grouped-asymmetric int4 experts (fmt=6) via DP4A. The int8-
+// quantized activation xq (4/uint) meets the int4 weights decoded to packed-int8 and
+// fed to dotPacked4x8EXT. Per group g:  contrib = scale_g*(Sum xq*nibble - zero_g*Sum xq),
+// then hidden = silu(gate*xs) * (up*xs). gscale/uscale hold interleaved
+// [scale_g, zero_g] pairs (O*ng*2). Nibbles are the raw fmt=6 quant values (0..15).
+//
+// The activation scale is PER ROW (from quant_rows.comp), not one value for the whole
+// group: LLM activations have outlier channels, so a shared amax would compress every
+// ordinary token into a handful of int8 codes.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_integer_dot_product : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer XQ { uint xq[]; };      // int8 activation, 4/uint [S, I/4]
+layout(std430, binding = 1) readonly  buffer XS { float xs[]; };     // per-row activation scale
+layout(std430, binding = 2) readonly  buffer WG { uint wg[]; };      // gate int4 weights
+layout(std430, binding = 3) readonly  buffer SG { float gscale[]; }; // [O*ng*2] scale,zero
+layout(std430, binding = 4) readonly  buffer WU { uint wu[]; };      // up int4 weights
+layout(std430, binding = 5) readonly  buffer SU { float uscale[]; }; // [O*ng*2]
+layout(std430, binding = 6) writeonly buffer H  { float hid[]; };    // [S, O]
+
+// XQ/XS are bound whole (a 4B-granular scale slice cannot meet
+// minStorageBufferOffsetAlignment), so sbase selects this expert's first row.
+layout(push_constant) uniform P { int S, I, O, rowWords, gs, sbase; } p;
+
+shared uint xsh[1536];   // I/4 uints (I <= 6144, matching the scalar gate_up kernel)
+
+int pkn(uint w) {        // 4 low nibbles of w -> packed int8 (values 0..15)
+    return int((w & 0xfu) | (((w >> 4) & 0xfu) << 8) | (((w >> 8) & 0xfu) << 16) | (((w >> 12) & 0xfu) << 24));
+}
+
+void main() {
+    int s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x), xwords = (p.I + 3) / 4;
+    int row = p.sbase + s;
+    for (int i = tid; i < xwords; i += 256) xsh[i] = xq[row * xwords + i];
+    barrier();
+    int lane = int(gl_SubgroupInvocationID), sgsize = int(gl_SubgroupSize);
+    int sg = int(gl_SubgroupID), nsg = 256 / sgsize, stride = int(gl_NumWorkGroups.x) * nsg;
+    int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+    float xscale = xs[row];
+    const int ONES = 0x01010101;
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
+        uint rb = uint(o) * uint(p.rowWords), sb = uint(o) * uint(ng) * 2u;
+        float g = 0.0, u = 0.0;
+        for (int wi = lane; wi < words; wi += sgsize) {
+            uint xu0 = xsh[2 * wi], xu1 = xsh[2 * wi + 1];
+            uint gp = wg[rb + uint(wi)], up = wu[rb + uint(wi)];
+            int gawn = dotPacked4x8EXT(int(xu0), pkn(gp)) + dotPacked4x8EXT(int(xu1), pkn(gp >> 16));
+            int uawn = dotPacked4x8EXT(int(xu0), pkn(up)) + dotPacked4x8EXT(int(xu1), pkn(up >> 16));
+            int ax   = dotPacked4x8EXT(int(xu0), ONES)   + dotPacked4x8EXT(int(xu1), ONES);
+            uint grp = uint(wi * 8 / p.gs) * 2u;
+            g += gscale[sb + grp] * (float(gawn) - gscale[sb + grp + 1u] * float(ax));
+            u += uscale[sb + grp] * (float(uawn) - uscale[sb + grp + 1u] * float(ax));
+        }
+        float gt = subgroupAdd(g) * xscale, ut = subgroupAdd(u) * xscale;
+        if (lane == 0) hid[s * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;
+    }
+}

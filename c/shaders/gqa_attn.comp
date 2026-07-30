@@ -1,0 +1,84 @@
+#version 450
+// Standard GQA decode attention for Qwen's full-attention layers — the VK
+// equivalent of qwen.c attention()'s per-(head,row) score/softmax/context loop.
+// One workgroup per (query row s = WorkGroupID.y, query head h = WorkGroupID.x):
+//   score_t = scale * dot(q_h, K[kh,t])        t in [st0, T-S+s]   (causal)
+//   p       = softmax(score)                   GQA: kh = h / (H/KH)
+//   ctx[d]  = (sum_t p_t * V[kh,t,d]) * sigmoid(gate_h[d])
+// K/V are the persistent device KV mirror rows (host appends normed+roped k and
+// raw v each token; row = kh*max_t + t). Queries arrive already normed+roped, laid
+// out [q(hd) | gate(hd)] per head. Fused online-softmax over TJ-token tiles: the V
+// re-read hits L2 right after the score pass (same layout idea as attention_absorb).
+// head_dim <= 256 (shared q tile + one ctx dim per thread).
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer QB { float q[]; };   // [S,H,2*hd] (q|gate)
+layout(std430, binding = 1) readonly  buffer KB { float kc[]; };  // K mirror [KH*max_t, hd]
+layout(std430, binding = 2) readonly  buffer VB { float vc[]; };  // V mirror [KH*max_t, hd]
+layout(std430, binding = 3) writeonly buffer CB { float ctx[]; }; // [S,H,hd] out (pre o_proj)
+
+layout(push_constant) uniform P {
+    int S, H, KH, hd, max_t, st0, T;
+    float scale;
+} p;
+
+const int TJ = 16;              // cache rows per online-softmax tile
+shared float qsh[256];          // q_h (head_dim <= 256)
+shared float scs[TJ];           // tile scores
+
+void main() {
+    int h   = int(gl_WorkGroupID.x);
+    int s   = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int nth = int(gl_WorkGroupSize.x);
+    int lane   = int(gl_SubgroupInvocationID);
+    int sgsize = int(gl_SubgroupSize);
+    int sg     = int(gl_SubgroupID);
+    int nsg    = nth / sgsize;
+
+    int gq   = p.H / p.KH;
+    int kh   = h / gq;
+    int qoff = (s * p.H + h) * 2 * p.hd;          // [q(hd) | gate(hd)] per head
+    int nt   = (p.T - p.S + s + 1) - p.st0;       // causal window for query row s
+
+    for (int d = tid; d < p.hd; d += nth) qsh[d] = q[qoff + d];
+    barrier();
+
+    float run_m = -3.0e38, run_l = 0.0;           // running softmax (max, denom)
+    float acc = 0.0;                              // thread tid accumulates ctx dim tid
+    for (int j0 = 0; j0 < nt; j0 += TJ) {
+        int nj = min(TJ, nt - j0);
+        for (int j = sg; j < nj; j += nsg) {      // one subgroup per t: full dot over hd
+            int t   = p.st0 + j0 + j;
+            int row = kh * p.max_t + t;
+            float a = 0.0;
+            for (int i = lane; i < p.hd; i += sgsize) a += qsh[i] * kc[row * p.hd + i];
+            float tot = subgroupAdd(a) * p.scale;
+            if (lane == 0) scs[j] = tot;
+        }
+        barrier();
+        {   // per-thread online softmax bookkeeping + rescale-accumulate ctx
+            float tmax = run_m;
+            for (int j = 0; j < nj; j++) tmax = max(tmax, scs[j]);
+            float f = exp(run_m - tmax), l = run_l * f;
+            float e[TJ];
+            for (int j = 0; j < nj; j++) { e[j] = exp(scs[j] - tmax); l += e[j]; }
+            run_m = tmax; run_l = l;
+            if (tid < p.hd) {
+                float a = acc * f;
+                for (int j = 0; j < nj; j++) {
+                    int row = kh * p.max_t + (p.st0 + j0 + j);
+                    a += e[j] * vc[row * p.hd + tid];
+                }
+                acc = a;
+            }
+        }
+        barrier();                                // scs reused next tile
+    }
+    if (tid < p.hd) {
+        float inv = run_l > 0.0 ? 1.0 / run_l : 0.0;
+        float g = q[qoff + p.hd + tid];           // output gate: * sigmoid(gate)
+        ctx[(s * p.H + h) * p.hd + tid] = acc * inv * (1.0 / (1.0 + exp(-g)));
+    }
+}

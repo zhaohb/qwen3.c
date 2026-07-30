@@ -1,0 +1,38 @@
+qwen3.c
+Copyright 2026 qwen3.c contributors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+----
+
+This product includes software developed from / derived from:
+
+  Colibrì
+  https://github.com/JustVugg/colibri
+  Licensed under the Apache License, Version 2.0
+
+Portions of the engine, Vulkan backend, shaders, and converters originate
+from that project and remain under Apache-2.0. Modifications and packaging
+as qwen3.c are likewise under Apache-2.0.
+
+----
+
+Third-party materials NOT covered by this repository's Apache-2.0 license:
+
+  - Qwen model weights and tokenizers (Alibaba / model card terms)
+  - GPTQ / community quantized checkpoints (their respective publishers)
+  - Converted SNAP containers (*.safetensors, .coli_usage, etc.) derived
+    from those weights
+
+Do not redistribute model weights under this License. Obtain and use them
+under the terms published with each checkpoint.

@@ -1,0 +1,27 @@
+#version 450
+// Pack GDN decay/beta/gnorm on device so b/a projections never round-trip to the host.
+//   decay[h] = exp(-exp(alog[h]) * softplus(a[h] + dtb[h]))
+//   beta[h]  = sigmoid(b[h])
+//   params = [decay(VH) | beta(VH) | gnorm(VD)]
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer A  { float a[]; };
+layout(std430, binding = 1) readonly  buffer B  { float b[]; };
+layout(std430, binding = 2) readonly  buffer AL { float alog[]; };
+layout(std430, binding = 3) readonly  buffer DT { float dtb[]; };
+layout(std430, binding = 4) readonly  buffer GN { float gnorm[]; };
+layout(std430, binding = 5) writeonly buffer P  { float params[]; };
+
+layout(push_constant) uniform PC { int VH, VD; } p;
+
+float softplus_(float x) { return x > 20.0 ? x : log(1.0 + exp(x)); }
+
+void main() {
+    int tid = int(gl_GlobalInvocationID.x);
+    if (tid < p.VH) {
+        float aa = a[tid] + dtb[tid];
+        params[tid] = exp(-exp(alog[tid]) * softplus_(aa));
+        params[p.VH + tid] = 1.0 / (1.0 + exp(-b[tid]));
+    }
+    if (tid < p.VD) params[2 * p.VH + tid] = gnorm[tid];
+}

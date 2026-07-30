@@ -1,0 +1,30 @@
+# Build artifacts
+*.o
+*.exe
+*.spv
+.build-config
+qwen
+qwen_vk
+qwen_vk.exe
+backend_vulkan.o
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Model containers / caches (do not commit)
+**/SNAP*/
+**/.coli_usage*
+*.safetensors
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+run.log

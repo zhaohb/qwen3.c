@@ -1,14 +1,22 @@
 #version 450
 // Softmax over router logits then greedy top-K without replacement, matching
 // qwen.c's host path: softmax_row → K×(argmax with strict >) → renorm.
+// Optionally packs MoE mix weights (routed probs + shared-expert gate) so the
+// separate moe_pack_w pass can be skipped on the moe_ix hot path.
 // One workgroup; E must be <= 256 (Qwen3.5/3.6-MoE). Ties keep the lower index.
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer L   { float logits[]; };
 layout(std430, binding = 1) writeonly buffer IDX { int idx[]; };
 layout(std430, binding = 2) buffer VAL { float val[]; }; /* read-write: filled then renormed */
+layout(std430, binding = 3) readonly buffer N { float nrm[]; };
+layout(std430, binding = 4) readonly buffer SG { float sh_gate[]; };
+layout(std430, binding = 5) writeonly buffer MW { float moe_w[]; };
 
-layout(push_constant) uniform PC { int E, K, base; } p; /* base: idx/val offset for ping-pong */
+layout(push_constant) uniform PC {
+    int E, K, base;   /* base: idx/val offset for ping-pong */
+    int D, do_pack;   /* do_pack: write moe_w; shared gate when D>0 */
+} p;
 
 shared float s_work[256];
 shared float s_red[256];
@@ -68,5 +76,22 @@ void main() {
         for (int k = 0; k < p.K; k++) sm += val[p.base + k];
         float inv = (sm > 0.0) ? (1.0 / sm) : 0.0;
         for (int k = 0; k < p.K; k++) val[p.base + k] *= inv;
+    }
+    barrier();
+
+    /* Optional pack: moe_w[0..K) = renormed probs; moe_w[K] = shared gate. */
+    if (p.do_pack != 0) {
+        if (tid < p.K) moe_w[tid] = val[p.base + tid];
+        if (p.D > 0) {
+            float partial = 0.0;
+            for (int i = tid; i < p.D; i += 256) partial += sh_gate[i] * nrm[i];
+            s_red[tid] = partial;
+            barrier();
+            for (int off = 128; off > 0; off >>= 1) {
+                if (tid < off) s_red[tid] += s_red[tid + off];
+                barrier();
+            }
+            if (tid == 0) moe_w[p.K] = 1.0 / (1.0 + exp(-s_red[0]));
+        }
     }
 }

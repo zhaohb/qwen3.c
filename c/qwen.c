@@ -1899,6 +1899,7 @@ static int run_text_mode(Model *m, const char *snap, const char *user, int ngen)
            tot ? 100.0 * m->hits / tot : 0.0,
            (unsigned long long)m->hits, (unsigned long long)m->miss);
 #ifdef COLI_VULKAN
+    coli_vk_decode_prof(t_dec * 1000.0, n_dec);
     if (g_qwen_opts.eg_stats) coli_vk_route_cache_stats();
     { long tt = g_vk_srv + g_vk_unsrv;
       printf("[VK] routed experts: tier-served %ld (%.1f%%), CPU %ld\n",

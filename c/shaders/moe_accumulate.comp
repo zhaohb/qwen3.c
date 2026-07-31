@@ -2,6 +2,7 @@
 // resid[d] += sum_c weights[c] * y[c*D + d] — folds the expert_group outputs back into
 // the device residual stream so the next layer's route can wait on a GPU semaphore
 // instead of a host fence + memcpy.
+// Mix weights are packed by softmax_topk (moe_ix path) or filled by the host (eg path).
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly  buffer Y { float y[]; };       // [count, D]

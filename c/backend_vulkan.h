@@ -210,6 +210,8 @@ int  coli_vk_stream_norm_argmax(ColiVkTensor **tensor, const void *weights, cons
 /* Copy post-stream_end resid from the device-mapped stream buffer (fallback path). */
 int  coli_vk_stream_copy_resid(float *x, int D);
 void coli_vk_route_cache_stats(void);
+/* --vk-prof: split the measured decode window into fence wait / submit / host. */
+void coli_vk_decode_prof(double decode_ms, int tokens);
 int  coli_vk_gdn_ba_weight(int layer, const float *alog, const float *dtb,
                            const float *gnorm, int VH, int VD);
 int  coli_vk_gqa_full_route_pipe(int layer, int D,

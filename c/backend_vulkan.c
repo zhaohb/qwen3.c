@@ -38,6 +38,13 @@ static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[VK] %s failed: %d\n", what, _r); return 0; } } while (0)
 
+/* --vk-prof timestamps. A route CB carries DP_TS_N of them (entry, then one per
+ * stage) so the ~0.5 ms per layer splits into attention / route tail / MoE. Two
+ * groups ping-pong with the CBs, one covers the sync route CB, and a final pair
+ * brackets the lm_head + argmax submit. */
+#define DP_TS_N 4
+#define DP_TSQ_AM (3 * DP_TS_N)
+
 struct ColiVkTensor {
     VkBuffer wbuf, sbuf;
     VkDeviceMemory wmem, smem;
@@ -195,6 +202,9 @@ static struct {
     int route_cache_hits, route_cache_misses;
     /* Device-resident final RMSNorm weight for stream→norm→lm_head argmax fuse. */
     VkBuffer final_nw; VkDeviceMemory final_nwm; void *final_nwp; int final_nD;
+    /* --vk-prof: timestamps bracketing each route CB. Two queries per ping-pong
+     * slot plus two for the sync CB; ts_base_rec tracks the pair being recorded. */
+    VkQueryPool tsq; double ts_period_ms; int ts_base_rec, pp_tsq[2];
     VkBuffer eg_pipe_xb, eg_pipe_hb, eg_pipe_yb, eg_pipe_wb, eg_pipe_sb, eg_pipe_nb;
     VkBuffer eg_pipe_xqb, eg_pipe_xsb, eg_pipe_hqb, eg_pipe_hsb;
     VkBuffer eg_cache_gw[64], eg_cache_gs[64], eg_cache_uw[64], eg_cache_us[64];
@@ -286,7 +296,8 @@ struct PCGdnCv { uint32_t KH, KD, VH, VD, key_dim; float eps; };  /* gdn_delta_c
 struct PCQkv { int S, H, KH, hd, rot, pos_base, max_t; float eps, theta; };
 struct PCRep { int count, D; };
 struct PCGdp { int VH, VD; };
-struct PCTopk { int E, K, base; }; /* base: ping-pong offset into idx/val */
+/* softmax_topk.comp: do_pack writes moe_w[0..K) (+ shared gate at K when D>0). */
+struct PCTopk { int E, K, base, D, do_pack; };
 struct PCMoeIx { int mode, K, D, I, E, base, rowWords_g, rowWords_d, gs, do_shared, ibase; };
 struct PCMoePack { int K, D, do_shared, base; };
 
@@ -761,7 +772,7 @@ int coli_vk_init(const char *spv_path) {
                                 &G.pipe_macc, &G.dpool_macc, &G.dset_macc) ||
                 !build_pipeline(6, sizeof(struct PCGdp), G.shader_gdp, &G.dsl_gdp, &G.plyt_gdp,
                                 &G.pipe_gdp, &G.dpool_gdp, &G.dset_gdp) ||
-                !build_pipeline(3, sizeof(struct PCTopk), G.shader_topk, &G.dsl_topk, &G.plyt_topk,
+                !build_pipeline(6, sizeof(struct PCTopk), G.shader_topk, &G.dsl_topk, &G.plyt_topk,
                                 &G.pipe_topk, &G.dpool_topk, &G.dset_topk))
                 return 0;
             VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 8};
@@ -888,6 +899,14 @@ int coli_vk_init(const char *spv_path) {
 
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
+    /* --vk-prof timestamp pairs: 2 per ping-pong slot + 2 for the sync route CB. */
+    if (g_qwen_opts.vk_prof && p.limits.timestampPeriod > 0.0f) {
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = DP_TSQ_AM + DP_TS_N};
+        if (vkCreateQueryPool(G.dev, &qi, NULL, &G.tsq) != VK_SUCCESS) G.tsq = VK_NULL_HANDLE;
+        else G.ts_period_ms = (double)p.limits.timestampPeriod / 1e6;
+    }
+    G.ts_base_rec = -1; G.pp_tsq[0] = G.pp_tsq[1] = -1;
     fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s%s\n", p.deviceName, G.qfam, G.memtype,
             G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "",
             G.shader_attf ? ", flash absorb" : "");
@@ -1026,6 +1045,86 @@ static VkResult vk_fence_wait_loud(VkFence f, const char *who) {
     if (r != VK_SUCCESS)
         fprintf(stderr, "[VK] %s: fence wait failed: %d — disabling GPU offload, staying on CPU\n", who, r);
     return r;
+}
+
+/* Decode-path host accounting (--vk-prof). The ping-pong path keeps the CPU a
+ * layer ahead of the GPU, so what matters is the split between "blocked on a
+ * fence" (device-bound: the remaining headroom is bandwidth) and "recording +
+ * writing descriptors + submitting" (host-bound: worth attacking on the CPU). */
+static double g_dp_wait_ms, g_dp_sub_ms; static long g_dp_sub_n, g_dp_wait_n;
+static double g_dp_gpu_ms, g_dp_am_ms; static long g_dp_gpu_n, g_dp_am_n;
+static double dp_t0(void) { return g_qwen_opts.vk_prof ? vk_now() : 0.0; }
+
+static double g_seg_ms[DP_TS_N - 1];
+static void dp_ts_begin(VkCommandBuffer cb, int base) {
+    G.ts_base_rec = -1;
+    if (!G.tsq || !g_qwen_opts.vk_prof || base < 0) return;
+    G.ts_base_rec = base;
+    vkCmdResetQueryPool(cb, G.tsq, (uint32_t)base, DP_TS_N);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, G.tsq, (uint32_t)base);
+}
+/* Stage boundary k (1..DP_TS_N-1). Unwritten marks just read back as unavailable. */
+static void dp_ts_mark(VkCommandBuffer cb, int k) {
+    if (G.ts_base_rec < 0) return;
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, G.tsq, (uint32_t)(G.ts_base_rec + k));
+}
+static void dp_ts_end(VkCommandBuffer cb) { dp_ts_mark(cb, DP_TS_N - 1); }
+/* Call only after the CB's fence has signalled, so the queries are available. */
+static double dp_ts_read(int base) {
+    /* Argmax CB only writes timestamps at [base] and [base+DP_TS_N-1]. */
+    if (!G.tsq || base < 0 || !g_qwen_opts.vk_prof) return 0.0;
+    uint64_t t[DP_TS_N];
+    if (vkGetQueryPoolResults(G.dev, G.tsq, (uint32_t)base, DP_TS_N, sizeof(t), t, sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return 0.0;
+    if (t[DP_TS_N - 1] <= t[0]) return 0.0;
+    return (double)(t[DP_TS_N - 1] - t[0]) * G.ts_period_ms;
+}
+static void dp_ts_collect(int base) {
+    if (!G.tsq || base < 0 || !g_qwen_opts.vk_prof) return;
+    uint64_t t[DP_TS_N];
+    if (vkGetQueryPoolResults(G.dev, G.tsq, (uint32_t)base, DP_TS_N, sizeof(t), t, sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+    if (t[DP_TS_N - 1] <= t[0]) return;
+    g_dp_gpu_ms += (double)(t[DP_TS_N - 1] - t[0]) * G.ts_period_ms;
+    g_dp_gpu_n++;
+    for (int k = 1; k < DP_TS_N; k++)
+        if (t[k] > t[k - 1]) g_seg_ms[k - 1] += (double)(t[k] - t[k - 1]) * G.ts_period_ms;
+}
+static void dp_wait_add(double t0) {
+    if (g_qwen_opts.vk_prof) { g_dp_wait_ms += vk_now() - t0; g_dp_wait_n++; }
+}
+static void dp_sub_add(double t0) {
+    if (g_qwen_opts.vk_prof) { g_dp_sub_ms += vk_now() - t0; g_dp_sub_n++; }
+}
+
+void coli_vk_decode_prof(double decode_ms, int tokens) {
+    if (!g_qwen_opts.vk_prof || !g_dp_sub_n) return;
+    double other = decode_ms - g_dp_wait_ms - g_dp_sub_ms;
+    fprintf(stderr,
+        "[VK_PROF] decode %.0f ms / %d tok | fence wait %.0f ms (%.1f%%, n=%ld) | "
+        "submit %.0f ms (%.1f%%, n=%ld) | record+desc+host %.0f ms (%.1f%%)\n",
+        decode_ms, tokens, g_dp_wait_ms, 100.0 * g_dp_wait_ms / decode_ms, g_dp_wait_n,
+        g_dp_sub_ms, 100.0 * g_dp_sub_ms / decode_ms, g_dp_sub_n,
+        other, 100.0 * other / decode_ms);
+    if (tokens > 0)
+        fprintf(stderr, "[VK_PROF] per token: %.1f submits, wait %.2f ms, submit %.2f ms, host %.2f ms\n",
+                (double)g_dp_sub_n / tokens, g_dp_wait_ms / tokens,
+                g_dp_sub_ms / tokens, other / tokens);
+    /* GPU busy vs wall: the gap is bubbles between submits (device idle while the
+     * queue is empty), which is what merging CBs into fewer submits would buy. */
+    if (g_dp_gpu_n) {
+        double gpu = g_dp_gpu_ms + g_dp_am_ms;
+        fprintf(stderr, "[VK_PROF] on device: route %.0f ms over %ld CBs (%.3f ms/CB) + lm_head/argmax "
+                        "%.0f ms over %ld (%.3f ms) = %.1f%% of decode — bubble %.0f ms (%.1f%%)\n",
+                g_dp_gpu_ms, g_dp_gpu_n, g_dp_gpu_ms / g_dp_gpu_n,
+                g_dp_am_ms, g_dp_am_n, g_dp_am_n ? g_dp_am_ms / g_dp_am_n : 0.0,
+                100.0 * gpu / decode_ms, decode_ms - gpu, 100.0 * (decode_ms - gpu) / decode_ms);
+        fprintf(stderr, "[VK_PROF] route CB stages: attn %.0f ms (%.1f%%) | tail rmsnorm+router+topk %.0f ms (%.1f%%) | "
+                        "moe_ix %.0f ms (%.1f%%)\n",
+                g_seg_ms[0], 100.0 * g_seg_ms[0] / g_dp_gpu_ms,
+                g_seg_ms[1], 100.0 * g_seg_ms[1] / g_dp_gpu_ms,
+                g_seg_ms[2], 100.0 * g_seg_ms[2] / g_dp_gpu_ms);
+    }
 }
 
 /* Global submit/wait totals across EVERY synchronous GPU path (VK_PROF=1) — the
@@ -2368,6 +2467,7 @@ int coli_vk_stream_norm_argmax(ColiVkTensor **tensor, const void *weights, const
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    dp_ts_begin(G.cmd, DP_TSQ_AM);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrmz);
@@ -2391,13 +2491,19 @@ int coli_vk_stream_norm_argmax(ColiVkTensor **tensor, const void *weights, const
         vkCmdPushConstants(G.cmd, G.plyt_am, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(am), &am);
         vkCmdDispatch(G.cmd, stage == 0 ? (uint32_t)AM_GRP : 1u, 1, 1);
     }
+    dp_ts_end(G.cmd);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    double ts = dp_t0();
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    dp_sub_add(ts);
     G.cmd_ready = 0; G.bound_tensor = NULL;
+    double tw = dp_t0();
     if (vk_fence_wait_loud(G.fence, "stream_norm_argmax") != VK_SUCCESS) { G.ready = 0; return 0; }
+    dp_wait_add(tw);
+    { double ms = dp_ts_read(DP_TSQ_AM); if (ms > 0.0) { g_dp_am_ms += ms; g_dp_am_n++; } }
     *idx = (int)((const uint32_t *)G.am_pi.ptr)[0];
     if (val) *val = ((const float *)G.am_pv.ptr)[0];
     return 1;
@@ -2491,9 +2597,13 @@ pp_fail:
 
 static int pp_reclaim_slot(int slot) {
     if (!G.pp_inflight[slot]) return 1;
+    double tw = dp_t0();
     if (vk_fence_wait_loud(G.fence_pp[slot], "pp_reclaim") != VK_SUCCESS) {
         G.ready = 0; return 0;
     }
+    dp_wait_add(tw);
+    dp_ts_collect(G.pp_tsq[slot]);
+    G.pp_tsq[slot] = -1;
     G.pp_inflight[slot] = 0;
     int L = G.pp_layer[slot], K = G.pp_topk[slot];
     int ibase = slot * 64;
@@ -2765,15 +2875,28 @@ static void route_tail_record_stream(ColiVkTensor *router, int ln_layer, int D, 
     vkCmdDispatch(G.cmd_rec, (uint32_t)((E + 7) / 8), 1, 1);
     vkCmdPipelineBarrier(G.cmd_rec, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    VkDescriptorBufferInfo btk[3] = {
+    /* Pack mix weights into moe_w here (single WG) so moe_ix can skip moe_pack_w. */
+    int do_pack = 0;
+    if (coli_vk_moe_ix_available() && ln_layer >= 0 && ln_layer < G.eg_ix_nlayers &&
+        G.eg_ix_sh_ok[ln_layer] && G.eg_ix_shgate) {
+        size_t wb = (size_t)(K + 1) * 4;
+        if (scratch_reserve(&G.moe_w, wb < 256 ? 256 : wb)) do_pack = 1;
+    }
+    VkBuffer dummy = G.route_nrm.buf;
+    VkDescriptorBufferInfo btk[6] = {
         {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE},
         {.buffer = G.route_idx.buf, .range = VK_WHOLE_SIZE},
-        {.buffer = G.route_val.buf, .range = VK_WHOLE_SIZE}};
-    wr_desc(G.dset_topk, 3, btk);
+        {.buffer = G.route_val.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = do_pack ? G.route_nrm.buf : dummy, .range = VK_WHOLE_SIZE},
+        {.buffer = do_pack ? G.eg_ix_shgate : dummy,
+         .offset = do_pack ? (VkDeviceSize)(size_t)ln_layer * (size_t)D * 4 : 0,
+         .range = do_pack ? (VkDeviceSize)(size_t)D * 4 : VK_WHOLE_SIZE},
+        {.buffer = do_pack ? G.moe_w.buf : dummy, .range = VK_WHOLE_SIZE}};
+    wr_desc(G.dset_topk, 6, btk);
     vkCmdBindPipeline(G.cmd_rec, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_topk);
     vkCmdBindDescriptorSets(G.cmd_rec, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_topk, 0, 1, &G.dset_topk, 0, NULL);
     int ibase = G.pp_rec ? G.pp_slot * 64 : 0;
-    struct PCTopk ptk = {E, K, ibase};
+    struct PCTopk ptk = {E, K, ibase, do_pack ? D : 0, do_pack};
     vkCmdPushConstants(G.cmd_rec, G.plyt_topk, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ptk), &ptk);
     vkCmdDispatch(G.cmd_rec, 1, 1, 1);
 }
@@ -2796,21 +2919,6 @@ static int route_try_moe_ix_fused(int ln_layer, int D, int E, int topk) {
     vkCmdPipelineBarrier(G.cmd_rec, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 
-    VkDescriptorBufferInfo bpw[4] = {
-        {.buffer = G.route_val.buf, .range = VK_WHOLE_SIZE},
-        {.buffer = G.route_nrm.buf, .range = VK_WHOLE_SIZE},
-        {.buffer = G.eg_ix_shgate, .offset = (VkDeviceSize)(size_t)ln_layer * (size_t)D * 4,
-         .range = (VkDeviceSize)(size_t)D * 4},
-        {.buffer = G.moe_w.buf, .range = VK_WHOLE_SIZE}};
-    wr_desc(G.dset_moe_pack, 4, bpw);
-    vkCmdBindPipeline(G.cmd_rec, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_moe_pack);
-    vkCmdBindDescriptorSets(G.cmd_rec, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_moe_pack, 0, 1, &G.dset_moe_pack, 0, NULL);
-    struct PCMoePack pp = {K, D, do_sh, ibase};
-    vkCmdPushConstants(G.cmd_rec, G.plyt_moe_pack, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pp), &pp);
-    vkCmdDispatch(G.cmd_rec, 1, 1, 1);
-    vkCmdPipelineBarrier(G.cmd_rec, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-
     moe_ix_bind_runtime();
     vkCmdBindPipeline(G.cmd_rec, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_moe_ix);
     vkCmdBindDescriptorSets(G.cmd_rec, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_moe_ix, 0, 1, &G.dset_moe_ix, 0, NULL);
@@ -2826,6 +2934,7 @@ static int route_try_moe_ix_fused(int ln_layer, int D, int E, int topk) {
     vkCmdPipelineBarrier(G.cmd_rec, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 
+    /* Mix weights already packed by softmax_topk into moe_w. */
     VkDescriptorBufferInfo bacc[3] = {
         {.buffer = G.eg_y.buf, .range = VK_WHOLE_SIZE},
         {.buffer = G.moe_w.buf, .range = VK_WHOLE_SIZE},
@@ -2866,9 +2975,12 @@ static int route_submit_wait_topk(int *idx_out, float *val_out, int K, const cha
     }
     G.moe_ix_fused_last = fused_sig;
     G.moe_ix_fused = 0;
+    double ts = dp_t0();
     VKCHECK(vkResetFences(G.dev, 1, &fence), "resetFence");
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, fence), "queueSubmit");
+    dp_sub_add(ts);
     if (async) {
+        G.pp_tsq[slot] = G.ts_base_rec;   /* collected once this slot's fence signals */
         G.pp_inflight[slot] = 1;
         G.ix_hist_pending = 1;
         if (fused_sig) G.eg_sem_armed = 1;
@@ -2880,7 +2992,10 @@ static int route_submit_wait_topk(int *idx_out, float *val_out, int K, const cha
         G.cmd_ready = 0; G.bound_tensor = NULL;
         return 1;
     }
+    double tw = dp_t0();
     if (vk_fence_wait_loud(fence, tag) != VK_SUCCESS) { G.ready = 0; return 0; }
+    dp_wait_add(tw);
+    dp_ts_collect(G.ts_base_rec);
     if (fused_sig) G.eg_sem_armed = 1;
     if (waited_eg && G.eg_inflight) {
         if (vk_fence_wait(G.eg_fence) != VK_SUCCESS) { G.ready = 0; return 0; }
@@ -2957,6 +3072,7 @@ int coli_vk_gqa_full_route_pipe(int layer, int D,
     VKCHECK(vkResetCommandBuffer(G.cmd_rec, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd_rec, &begin), "beginCmd");
+    dp_ts_begin(G.cmd_rec, G.pp_rec ? G.pp_slot * DP_TS_N : 2 * DP_TS_N);
     vkCmdBindPipeline(G.cmd_rec, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrmz);
     vkCmdBindDescriptorSets(G.cmd_rec, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_nrm, 0, 1, &G.dset_nrm, 0, NULL);
     struct PCN pin = {S, D, eps};
@@ -2993,10 +3109,13 @@ int coli_vk_gqa_full_route_pipe(int layer, int D,
     struct PC po = {out_t->fmt, S, H * hd, Dout, out_t->rowWords, out_t->gs};
     vkCmdPushConstants(G.cmd_rec, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(po), &po);
     vkCmdDispatch(G.cmd_rec, (uint32_t)((Dout + 7) / 8), (uint32_t)S, 1);
+    dp_ts_mark(G.cmd_rec, 1);
     route_tail_record_stream(router, ln_layer, D, E, topk, eps);
+    dp_ts_mark(G.cmd_rec, 2);
     G.moe_ix_fused = 0;
     /* Expert fmt lives in the eg_table (fmt=6), not on dense attn tensors. */
     (void)route_try_moe_ix_fused(ln_layer, D, E, topk);
+    dp_ts_end(G.cmd_rec);
     VKCHECK(vkEndCommandBuffer(G.cmd_rec), "endCmd");
     return route_submit_wait_topk(idx_out, val_out, topk, "gqa_full_route_pipe");
 }
@@ -3075,6 +3194,7 @@ int coli_vk_gdn_full_route_pipe(int layer, int D,
     VKCHECK(vkResetCommandBuffer(G.cmd_rec, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd_rec, &begin), "beginCmd");
+    dp_ts_begin(G.cmd_rec, G.pp_rec ? G.pp_slot * DP_TS_N : 2 * DP_TS_N);
     /* 0) in_ln */
     vkCmdBindPipeline(G.cmd_rec, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrmz);
     vkCmdBindDescriptorSets(G.cmd_rec, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_nrm, 0, 1, &G.dset_nrm, 0, NULL);
@@ -3127,9 +3247,12 @@ int coli_vk_gdn_full_route_pipe(int layer, int D,
     struct PC po = {out_t->fmt, 1, value_dim, Dout, out_t->rowWords, out_t->gs};
     vkCmdPushConstants(G.cmd_rec, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(po), &po);
     vkCmdDispatch(G.cmd_rec, (uint32_t)((Dout + 7) / 8), 1, 1);
+    dp_ts_mark(G.cmd_rec, 1);
     route_tail_record_stream(router, ln_layer, D, E, topk, eps);
+    dp_ts_mark(G.cmd_rec, 2);
     G.moe_ix_fused = 0;
     (void)route_try_moe_ix_fused(ln_layer, D, E, topk);
+    dp_ts_end(G.cmd_rec);
     VKCHECK(vkEndCommandBuffer(G.cmd_rec), "endCmd");
     return route_submit_wait_topk(idx_out, val_out, topk, "gdn_full_route_pipe");
 }
@@ -3222,6 +3345,7 @@ static void eg_pipe_bind_scratch(int count, int D, int I, int dp4a, int dp4a_dn,
     }
     VkDescriptorBufferInfo brep[2] = {{G.route_nrm.buf, 0, VK_WHOLE_SIZE}, {G.eg_x.buf, 0, VK_WHOLE_SIZE}};
     wr_desc(G.dset_rep, 2, brep);
+    /* Host fills moe_w on this path. */
     VkDescriptorBufferInfo bacc[3] = {{G.eg_y.buf, 0, VK_WHOLE_SIZE}, {G.moe_w.buf, 0, VK_WHOLE_SIZE},
                                       {G.stream.buf, 0, VK_WHOLE_SIZE}};
     wr_desc(G.dset_macc, 3, bacc);
@@ -3813,6 +3937,7 @@ void coli_vk_shutdown(void) {
         vkDestroyBuffer(G.dev, G.final_nw, NULL); vkFreeMemory(G.dev, G.final_nwm, NULL);
         G.final_nw = VK_NULL_HANDLE; G.final_nwp = NULL; G.final_nD = 0;
     }
+    if (G.tsq) { vkDestroyQueryPool(G.dev, G.tsq, NULL); G.tsq = VK_NULL_HANDLE; }
     for (int i = 0; i < VK_KV_LAYERS; i++) {
         if (!G.gdn_alog[i]) continue;
         vkDestroyBuffer(G.dev, G.gdn_alog[i], NULL); vkFreeMemory(G.dev, G.gdn_alogm[i], NULL);

@@ -22,6 +22,9 @@ void qwen_opts_init_defaults(void) {
 #else
     z.vulkan = 0;
 #endif
+    z.dense_bits = 8;
+    z.lmhead_bits = 8;
+    z.dense_gs = 128;
     z.stream = 1;
     z.moe_ix = 0;
     z.experts = 1024;

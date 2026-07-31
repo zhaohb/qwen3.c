@@ -86,6 +86,7 @@ tier 已填满）时，建议用下面配置。
 cd /d <qwen3.c>\c
 qwen_vk.exe --snap <你的GPTQ容器目录> ^
   --shaders shaders\qmatmul.spv --stream --moe-ix --experts 7284 ^
+  --dense-bits 4 --lmhead-bits 4 ^
   --prompt "你好" --ngen 33 --chat 8
 ```
 
@@ -94,8 +95,29 @@ qwen_vk.exe --snap <你的GPTQ容器目录> ^
 | `--moe-ix` | 描述符索引 MoE + 双 CB 异步（decode 增益最大） |
 | `--stream` | decode residual stream + device top-k（默认开，建议显式写出） |
 | `--experts 7284` | 尽量 pin 满热专家，decode 接近 100% tier-served |
+| `--dense-bits 4` | 注意力 / GDN 投影按 int4 分组量化（默认 int8） |
+| `--lmhead-bits 4` | lm_head 按 int4 分组量化（默认 int8） |
 | `--ngen 33` | 测速用短 decode 窗口（32 步） |
 | 末尾 `8` | 每层 CPU LRU 深度（与 VRAM pin 数量无关） |
+
+### dense 量化位宽
+
+decode 时 dense 权重是单 token 读取量最大的一块：40 层投影约 1.4 GB，lm_head
+（2048×248320）自己就有 0.5 GB，合计比 top-8 专家还多。改成分组非对称 int4
+（fmt=6，默认 group size 128）几乎把这一路的带宽减半，VRAM 也从 1.88 GB 降到
+0.98 GB，腾出的空间可以多 pin 专家。
+
+Intel Arc B390 + Qwen3.5-35B-GPTQ 实测（`--experts 7284`，其余参数同上）：
+
+| 配置 | tok/s | dense VRAM |
+|------|-------|-----------|
+| 默认（都是 int8） | 33.1 | 1.88 GB |
+| `--lmhead-bits 4` | 35.2 | 1.62 GB |
+| `--dense-bits 4` | 37.4 | 1.24 GB |
+| 两个都开 | **40.5** | 0.98 GB |
+
+输出质量没有观察到退化（同一 prompt 下贪心解码结果与 int8 基本逐 token 一致，
+偶尔因浮点结合律不同而分叉）。默认仍是 int8，需要显式开启。
 
 日志应出现：`moe_ix ping-pong CBs ENABLED`、`moe_ix fused into route submit`，
 以及类似 `decode 32 tok in …s (~32 tok/s)` 的汇总。
@@ -113,6 +135,9 @@ qwen_vk.exe --snap <你的GPTQ容器目录> ^
 | `--stream` / `--moe-ix` | decode stream / 索引 MoE |
 | `--experts N` | VRAM 常驻热专家上限 |
 | `--reserve-gb F` | 设备侧预留 GB（默认 3） |
+| `--dense-bits N` | 投影权重 8 或 4 bit（默认 8） |
+| `--lmhead-bits N` | lm_head 权重 8 或 4 bit（默认 8） |
+| `--dense-gs N` | int4 分组大小（默认 128） |
 | `--ngen N` | 最大生成 token 数 |
 
 所有开关仅通过命令行 / 内置默认值配置（不再读环境变量）。

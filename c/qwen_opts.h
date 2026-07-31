@@ -32,6 +32,13 @@ typedef struct QwenOpts {
     int   ppl;            /* default 0 */
     int   cap;            /* CPU LRU depth; default 32 */
 
+    /* Dense (attn/GDN projections) and lm_head GPU quantization width.
+     * 8 = per-row int8 (fmt 1); 4 = grouped-asymmetric int4 (fmt 6, gs=dense_gs).
+     * int4 halves the per-token weight bytes of the dominant dense stream. */
+    int    dense_bits;    /* default 8 */
+    int    lmhead_bits;   /* default 8 */
+    int    dense_gs;      /* fmt=6 group size for dense/lm_head; default 128 */
+
     /* Vulkan engine (qwen.c) — defaults match former getenv logic */
     int    vulkan;        /* default 1 when built with COLI_VULKAN */
     int    stream;        /* default 1 (was: unset ⇒ on) */

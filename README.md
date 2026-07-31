@@ -85,6 +85,7 @@ Build `c\qwen_vk.exe` and `c\shaders\*.spv` first, then from `c`:
 cd /d <qwen3.c>\c
 qwen_vk.exe --snap <path-to-your-GPTQ-container> ^
   --shaders shaders\qmatmul.spv --stream --moe-ix --experts 7284 ^
+  --dense-bits 4 --lmhead-bits 4 ^
   --prompt "你好" --ngen 33 --chat 8
 ```
 
@@ -93,8 +94,31 @@ qwen_vk.exe --snap <path-to-your-GPTQ-container> ^
 | `--moe-ix` | Descriptor-indexed MoE + dual-CB async (largest decode gain) |
 | `--stream` | Decode residual stream + device top-k (default on; set explicitly) |
 | `--experts 7284` | Pin ~all hot experts so decode stays tier-served (~100%) |
+| `--dense-bits 4` | Grouped-int4 attention / GDN projections (default int8) |
+| `--lmhead-bits 4` | Grouped-int4 lm_head (default int8) |
 | `--ngen 33` | Short decode window for tok/s measurement (32 decode steps) |
 | trailing `8` | Per-layer CPU LRU depth (independent of VRAM pin count) |
+
+### Dense quantization width
+
+Dense weights are the largest per-token read at decode: ~1.4 GB across the 40
+layers' projections plus 0.5 GB for lm_head alone (2048×248320) — more than the
+top-8 experts combined. Grouped-asymmetric int4 (fmt=6, group size 128 by
+default) nearly halves that stream and drops dense VRAM from 1.88 GB to 0.98 GB,
+leaving room to pin more experts.
+
+Measured on Intel Arc B390 with Qwen3.5-35B-GPTQ (`--experts 7284`, flags above):
+
+| Config | tok/s | Dense VRAM |
+|--------|-------|-----------|
+| Default (all int8) | 33.1 | 1.88 GB |
+| `--lmhead-bits 4` | 35.2 | 1.62 GB |
+| `--dense-bits 4` | 37.4 | 1.24 GB |
+| Both | **40.5** | 0.98 GB |
+
+No quality regression observed — greedy decode tracks the int8 run token for
+token on the same prompt, diverging only where float reassociation differs.
+int8 is still the default; int4 is opt-in.
 
 Expect log lines: `moe_ix ping-pong CBs ENABLED`, `moe_ix fused into route submit`,
 and a summary like `decode 32 tok in …s (~32 tok/s)`.
@@ -112,6 +136,9 @@ If device budget is tight, lower `--experts` (e.g. `1024`) or raise
 | `--stream` / `--moe-ix` | Decode stream / indexed MoE |
 | `--experts N` | Max hot experts pinned in VRAM |
 | `--reserve-gb F` | Keep this much device budget free (default 3) |
+| `--dense-bits N` | Projection weights, 8 or 4 bit (default 8) |
+| `--lmhead-bits N` | lm_head weights, 8 or 4 bit (default 8) |
+| `--dense-gs N` | int4 group size (default 128) |
 | `--ngen N` | Max new tokens |
 
 All knobs are CLI / defaults only (no env-var fallback).

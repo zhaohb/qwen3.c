@@ -1528,6 +1528,9 @@ static void print_usage(const char *argv0) {
         "  --experts N             max hot experts pinned in VRAM (default 1024)\n"
         "  --reserve-gb F          device budget reserve GB (default 3)\n"
         "  --dense / --no-dense    dense matmul offload (default on)\n"
+        "  --dense-bits N          projection weights 8|4 bit (default 8)\n"
+        "  --lmhead-bits N         lm_head weights 8|4 bit (default 8)\n"
+        "  --dense-gs N            int4 group size (default 128)\n"
         "  --gdn / --no-gdn        GDN on GPU (default on)\n"
         "  --gdn-fuse / --no-gdn-fuse\n"
         "  --gqa / --no-gqa        full-attn GQA on GPU (default on)\n"
@@ -1760,10 +1763,13 @@ static int vkd_make(VkDense *d, const float *W, int I, int O, int fmt, int gs) {
 }
 
 /* GLM's vk_dense_preload, adapted: quantize the f32 dense working set (attention
- * and GDN projections int8, shared expert in the container's expert fmt so it can
- * join the expert_group submit, lm_head int8) and upload it BEFORE the tier fill,
+ * and GDN projections, shared expert in the container's expert fmt so it can
+ * join the expert_group submit, plus lm_head) and upload it BEFORE the tier fill,
  * so the budget-capped tier sizes itself to the true remainder. Frees the f32
- * originals on success — the host keeps only the quantized fallback copies. */
+ * originals on success — the host keeps only the quantized fallback copies.
+ * Width comes from --dense-bits / --lmhead-bits: 8 = per-row int8 (fmt 1),
+ * 4 = grouped-asymmetric int4 (fmt 6). Dense is the largest per-token weight
+ * stream at decode, so int4 roughly halves its bandwidth. */
 static void vk_dense_init(Model *m) {
     Cfg *c = &m->c;
     if (!m->vk_on) return;
@@ -1775,20 +1781,39 @@ static void vk_dense_init(Model *m) {
      * expert_group submit (the group decodes the whole batch with one fmt; a
      * fmt mismatch would reject the group and drop every expert to CPU). */
     int sfmt = c->expert_fmt == 6 ? 6 : efmt, sgs = c->expert_fmt == 6 ? c->group_size : 0;
+    if (g_qwen_opts.dense_bits != 8 && g_qwen_opts.dense_bits != 4)
+        fprintf(stderr, "[VK] --dense-bits %d unsupported (8|4) — using 8\n", g_qwen_opts.dense_bits);
+    if (g_qwen_opts.lmhead_bits != 8 && g_qwen_opts.lmhead_bits != 4)
+        fprintf(stderr, "[VK] --lmhead-bits %d unsupported (8|4) — using 8\n", g_qwen_opts.lmhead_bits);
+    /* fmt=6 needs gs % 8 == 0 (a packed uint32 must not straddle a group). */
+    int dgs = g_qwen_opts.dense_gs;
+    if (dgs < 8 || dgs % 8) {
+        fprintf(stderr, "[VK] --dense-gs %d invalid (>=8, multiple of 8) — using 128\n", dgs);
+        dgs = 128;
+    }
+    int dfmt = g_qwen_opts.dense_bits == 4 ? 6 : 1;
+    int dgs_use = dfmt == 6 ? dgs : 0;
+    int hfmt = g_qwen_opts.lmhead_bits == 4 ? 6 : 1;
+    int hgs_use = hfmt == 6 ? dgs : 0;
+    if (dfmt == 6 || hfmt == 6)
+        printf("[VK] dense quant: projections int%d, lm_head int%d (fmt6 gs=%d)\n",
+               g_qwen_opts.dense_bits == 4 ? 4 : 8,
+               g_qwen_opts.lmhead_bits == 4 ? 4 : 8, dgs);
     double t0 = now_s(); int64_t bytes = 0; int nt = 0, full = 0;
     for (int i = 0; i < c->n_layers && !full; i++) {
         Layer *l = &m->L[i];
         struct { VkDense *d; float **w; int I, O, fmt, gs; } ts[] = {
-            {&l->gq,   &l->q,    c->hidden,               c->n_heads*c->head_dim*2,  1,    0},
-            {&l->gk,   &l->k,    c->hidden,               c->n_kv_heads*c->head_dim, 1,    0},
-            {&l->gv,   &l->v,    c->hidden,               c->n_kv_heads*c->head_dim, 1,    0},
-            {&l->go,   &l->o,    c->n_heads*c->head_dim,  c->hidden,                 1,    0},
-            {&l->gqkv, &l->qkv,  c->hidden,               c->conv_dim,               1,    0},
-            {&l->gz,   &l->z,    c->hidden,               c->value_dim,              1,    0},
-            {&l->gout, &l->outp, c->value_dim,            c->hidden,                 1,    0},
+            {&l->gq,   &l->q,    c->hidden,               c->n_heads*c->head_dim*2,  dfmt, dgs_use},
+            {&l->gk,   &l->k,    c->hidden,               c->n_kv_heads*c->head_dim, dfmt, dgs_use},
+            {&l->gv,   &l->v,    c->hidden,               c->n_kv_heads*c->head_dim, dfmt, dgs_use},
+            {&l->go,   &l->o,    c->n_heads*c->head_dim,  c->hidden,                 dfmt, dgs_use},
+            {&l->gqkv, &l->qkv,  c->hidden,               c->conv_dim,               dfmt, dgs_use},
+            {&l->gz,   &l->z,    c->hidden,               c->value_dim,              dfmt, dgs_use},
+            {&l->gout, &l->outp, c->value_dim,            c->hidden,                 dfmt, dgs_use},
             {&l->gsg,  &l->sh_g, c->hidden,               c->sh_inter,            sfmt, sgs},
             {&l->gsu,  &l->sh_u, c->hidden,               c->sh_inter,            sfmt, sgs},
             {&l->gsd,  &l->sh_d, c->sh_inter,             c->hidden,              sfmt, sgs},
+            /* router picks the experts — keep it int8, it is tiny and error-sensitive */
             {&l->grouter, &l->router, c->hidden,          c->n_experts,           1,    0},
             {&l->gba,  &l->a,     c->hidden,               c->gdn_vh,               1,    0},
             {&l->gbb,  &l->b,     c->hidden,               c->gdn_vh,               1,    0},
@@ -1806,7 +1831,7 @@ static void vk_dense_init(Model *m) {
             bytes += coli_vk_tensor_bytes(ts[k].d->t); nt++;
         }
     }
-    if (!full && vkd_make(&m->glmh, m->lm_head, c->hidden, c->vocab, 1, 0)) {
+    if (!full && vkd_make(&m->glmh, m->lm_head, c->hidden, c->vocab, hfmt, hgs_use)) {
         if (m->lm_head != m->embed) { free(m->lm_head); m->lm_head = NULL; }  /* tied: embed stays */
         bytes += coli_vk_tensor_bytes(m->glmh.t); nt++;
     }
@@ -1914,6 +1939,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--no-moe-ix")) { g_qwen_opts.moe_ix = 0; }
         else if (!strcmp(a, "--dense")) { g_qwen_opts.dense = 1; }
         else if (!strcmp(a, "--no-dense")) { g_qwen_opts.dense = 0; }
+        else if (!strcmp(a, "--dense-bits")) { NEED_ARG(); g_qwen_opts.dense_bits = atoi(argv[++i]); }
+        else if (!strcmp(a, "--lmhead-bits")) { NEED_ARG(); g_qwen_opts.lmhead_bits = atoi(argv[++i]); }
+        else if (!strcmp(a, "--dense-gs")) { NEED_ARG(); g_qwen_opts.dense_gs = atoi(argv[++i]); }
         else if (!strcmp(a, "--gdn")) { g_qwen_opts.gdn = 1; }
         else if (!strcmp(a, "--no-gdn")) { g_qwen_opts.gdn = 0; }
         else if (!strcmp(a, "--gdn-fuse")) { g_qwen_opts.gdn_fuse = 1; }

@@ -1044,13 +1044,14 @@ static void moeb_cpu(const MoeB *b, int e, int r0, int nr) {
 #define MOEB_MAXE    64     /* coli_vk_expert_group caps one submit at 64 experts */
 #define MOEB_MAXROWS 1024   /* and this caps its packed x/hidden/y scratch (~18 MB at D=2048) */
 
-static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int S, float *out) {
+/* Prefill MoE given raw router logits [S,E] (mutated in-place by softmax). Groups
+ * tokens by expert so each weight stream is read once with rows>1 — also used by the
+ * route-fuse path which already computed pr on device. */
+static void moe_batch_from_logits(Model *m, Layer *l, int layer, const float *xs,
+                                  float *pr, int S, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->n_experts, TK = c->topk, I = c->inter;
 
-    /* route all S tokens with one matmul, then softmax + top-k + renorm per row */
-    float *pr = falloc((int64_t)S * E);
-    mm_dense(&l->grouter, l->router, pr, xs, S, D, E);
     int *tidx = ialloc((int64_t)S * TK);
     float *tval = falloc((int64_t)S * TK);
     for (int s = 0; s < S; s++) {
@@ -1069,7 +1070,6 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int S, flo
         for (int kk = 0; kk < TK; kk++) vl[kk] /= sm;
         for (int kk = 0; kk < TK; kk++) m->eusage[(size_t)layer * E + id[kk]]++;
     }
-    free(pr);
     memset(out, 0, (size_t)S * D * sizeof(float));
 
     /* bucket the (token, slot) pairs by expert: counts -> offsets -> flat pair list */
@@ -1152,6 +1152,15 @@ static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int S, flo
         free(g); free(u); free(sh);
     }
     free(tidx); free(tval); free(ecnt); free(ecur); free(epair); free(gpu); free(cpu);
+}
+
+static void moe_batch(Model *m, Layer *l, int layer, const float *xs, int S, float *out) {
+    Cfg *c = &m->c;
+    int D = c->hidden, E = c->n_experts;
+    float *pr = falloc((int64_t)S * E);
+    mm_dense(&l->grouter, l->router, pr, xs, S, D, E);
+    moe_batch_from_logits(m, l, layer, xs, pr, S, out);
+    free(pr);
 }
 
 /* ---------- one forward step over S new tokens ---------- */
@@ -1294,14 +1303,10 @@ static void decode_stack(Model *m, const int *ids, int S, int pos_base, float *l
                 else m->vk_gdn_full_on = 0;
             }
             if (ok) {
-                if (S > 1) {
-                    /* fused route produced per-token logits; apply experts per row */
-                    for (int s = 0; s < S; s++)
-                        moe_from_logits(m, l, i, nrm + (int64_t)s*D, pr + (int64_t)s*E,
-                                        tmp + (int64_t)s*D);
-                } else {
+                if (S > 1)
+                    moe_batch_from_logits(m, l, i, nrm, pr, S, tmp);  /* prefill: batch by expert */
+                else
                     moe_from_logits(m, l, i, nrm, pr, tmp);
-                }
                 for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
                 free(pr);
                 continue;
@@ -1316,6 +1321,32 @@ static void decode_stack(Model *m, const int *ids, int S, int pos_base, float *l
             attention(m, l, kvi, nrm, S, pos_base, tmp);
             kvi++;
         } else {
+#ifdef COLI_VULKAN
+            /* Prefill: chunked GDN on one CB per up-to-64 tokens (fewer fences). */
+            int gdn_seq = 0;
+            if (S > 1 && m->vk_gdn_full_on && l->gqkv.t && l->gz.t && l->gout.t) {
+                int VH = c->gdn_vh, VD = c->gdn_vd, prs = 2 * VH + VD;
+                float *params = falloc((int64_t)S * prs);
+                float b[64], a[64];
+                for (int s = 0; s < S; s++) {
+                    const float *xs = nrm + (int64_t)s * D;
+                    float *ps = params + (int64_t)s * prs;
+                    matmul(b, xs, l->b, 1, D, VH);
+                    matmul(a, xs, l->a, 1, D, VH);
+                    for (int h = 0; h < VH; h++) {
+                        ps[h]      = expf(-expf(l->alog[h]) * softplusf_(a[h] + l->dtb[h]));
+                        ps[VH + h] = sigmoidf_(b[h]);
+                    }
+                    memcpy(ps + 2 * VH, l->gnorm, VD * sizeof(float));
+                }
+                gdn_seq = coli_vk_gdn_full_seq(gi, nrm, S, D, l->gqkv.t, l->gz.t, params,
+                                               l->gout.t, tmp, c->gdn_kh, c->gdn_kd, VH, VD,
+                                               c->conv_dim, c->conv_k, c->eps, D);
+                free(params);
+                if (!gdn_seq) m->vk_gdn_full_on = 0;
+            }
+            if (!gdn_seq)
+#endif
             for (int s = 0; s < S; s++)        /* recurrence is inherently sequential over tokens */
                 gdn_step(m, l, gi, nrm + (int64_t)s*D, tmp + (int64_t)s*D);
             gi++;

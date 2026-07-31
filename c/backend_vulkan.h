@@ -261,6 +261,14 @@ int  coli_vk_gdn_conv_weight(int layer, const float *cw, int conv_k, int conv_di
 int  coli_vk_gdn_full(int layer, const float *x, int D, ColiVkTensor *gqkv_t, ColiVkTensor *gz_t,
                       const float *params, ColiVkTensor *out_t, float *out,
                       int KH, int KD, int VH, int VD, int conv_dim, int conv_k, float eps, int Dout);
+/* Prefill: run S GDN tokens in chunked submits (default 64/CB) so device state/ring
+ * still advances sequentially but host fences drop from S to ~ceil(S/64) per layer.
+ * params is [S, 2*VH+VD]; out is [S, Dout]. S==1 delegates to coli_vk_gdn_full. */
+int  coli_vk_gdn_full_seq(int layer, const float *x, int S, int D,
+                          ColiVkTensor *gqkv_t, ColiVkTensor *gz_t, const float *params,
+                          ColiVkTensor *out_t, float *out,
+                          int KH, int KD, int VH, int VD, int conv_dim, int conv_k,
+                          float eps, int Dout);
 
 #ifdef __cplusplus
 }

@@ -332,7 +332,9 @@ static int pick_memtype_cached(void) {
 
 static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .size = bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
@@ -1861,6 +1863,146 @@ int coli_vk_gdn_full(int layer, const float *x, int D, ColiVkTensor *gqkv_t, Col
     if (vk_fence_wait_loud(G.fence, "gdn_full") != VK_SUCCESS) { G.ready = 0; return 0; }
     memcpy(out, G.y.ptr, (size_t)Dout * 4);
     G.cmd_ready = 0; G.bound_tensor = NULL;
+    return 1;
+}
+
+/* Prefill GDN: pack up to GDN_SEQ_CHUNK tokens into one CB. Recurrent state stays
+ * sequential via barriers; fences fall from one-per-token to one-per-chunk.
+ * Descriptors stay fixed on single-token work buffers; each token is staged in via
+ * vkCmdCopyBuffer from the host-uploaded batch (updating a bound set mid-CB would
+ * make every dispatch see the last token's offsets). */
+#define GDN_SEQ_CHUNK 64
+
+int coli_vk_gdn_full_seq(int layer, const float *x, int S, int D,
+                         ColiVkTensor *gqkv_t, ColiVkTensor *gz_t, const float *params,
+                         ColiVkTensor *out_t, float *out,
+                         int KH, int KD, int VH, int VD, int conv_dim, int conv_k,
+                         float eps, int Dout) {
+    if (S == 1)
+        return coli_vk_gdn_full(layer, x, D, gqkv_t, gz_t, params, out_t, out,
+                                KH, KD, VH, VD, conv_dim, conv_k, eps, Dout);
+    if (!coli_vk_gdn_full_available() || !gqkv_t || !gz_t || !out_t || S < 1) return 0;
+    if (layer < 0 || layer >= VK_KV_LAYERS || VD > 512 || KD > 256 || (VH % KH) != 0) return 0;
+    if (!G.gdn_st[layer] || !G.gdn_ring[layer] || !G.gdn_cw[layer]) return 0;
+    int key_dim = KH * KD, value_dim = VH * VD;
+    int pr_stride = 2 * VH + VD;
+    if (gqkv_t->I != D || gqkv_t->O != conv_dim || gz_t->I != D || gz_t->O != value_dim ||
+        out_t->I != value_dim || out_t->O != Dout || conv_dim != 2 * key_dim + value_dim) return 0;
+
+    VkMemoryBarrier mb_c = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    VkMemoryBarrier mb_t2c = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    VkMemoryBarrier mb_c2t = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+
+    for (int s0 = 0; s0 < S; s0 += GDN_SEQ_CHUNK) {
+        int n = S - s0; if (n > GDN_SEQ_CHUNK) n = GDN_SEQ_CHUNK;
+        size_t xb = (size_t)n * D * 4, prb = (size_t)n * (size_t)pr_stride * 4;
+        size_t yb = (size_t)n * Dout * 4;
+        size_t x1 = (size_t)D * 4, pr1 = (size_t)pr_stride * 4, y1 = (size_t)Dout * 4;
+        /* batch uploads: route_x / y2 / gdnf_pr; single-token work: x / gdn_ba / y */
+        if (!scratch_reserve(&G.route_x, xb) || !scratch_reserve(&G.gdnf_pr, prb) ||
+            !scratch_reserve_mt(&G.y2, yb, G.memtype_cached) ||
+            !scratch_reserve(&G.x, x1) || !scratch_reserve(&G.gdn_ba, pr1) ||
+            !scratch_reserve_mt(&G.y, y1, G.memtype_cached) ||
+            !scratch_reserve(&G.gdnf_qkv, (size_t)conv_dim * 4) ||
+            !scratch_reserve(&G.gdnf_z, (size_t)value_dim * 4) ||
+            !scratch_reserve(&G.gdnf_cv, (size_t)conv_dim * 4) ||
+            !scratch_reserve(&G.gdn_y, (size_t)value_dim * 4))
+            return 0;
+        memcpy(G.route_x.ptr, x + (int64_t)s0 * D, xb);
+        memcpy(G.gdnf_pr.ptr, params + (int64_t)s0 * pr_stride, prb);
+
+        /* Bind once to fixed single-token work buffers. */
+        VkDescriptorBufferInfo bqkv[4] = {
+            {.buffer=G.x.buf,.range=VK_WHOLE_SIZE}, {.buffer=gqkv_t->wbuf,.range=VK_WHOLE_SIZE},
+            {.buffer=gqkv_t->sbuf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdnf_qkv.buf,.range=VK_WHOLE_SIZE}};
+        wr_desc(G.gdnf_gqkv, 4, bqkv);
+        VkDescriptorBufferInfo bz[4] = {
+            {.buffer=G.x.buf,.range=VK_WHOLE_SIZE}, {.buffer=gz_t->wbuf,.range=VK_WHOLE_SIZE},
+            {.buffer=gz_t->sbuf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdnf_z.buf,.range=VK_WHOLE_SIZE}};
+        wr_desc(G.gdnf_gz, 4, bz);
+        VkDescriptorBufferInfo bc[4] = {
+            {.buffer=G.gdnf_qkv.buf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdn_cw[layer],.range=VK_WHOLE_SIZE},
+            {.buffer=G.gdn_ring[layer],.range=VK_WHOLE_SIZE}, {.buffer=G.gdnf_cv.buf,.range=VK_WHOLE_SIZE}};
+        wr_desc(G.dset_gdnconv, 4, bc);
+        VkDescriptorBufferInfo bd[5] = {
+            {.buffer=G.gdnf_cv.buf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdnf_z.buf,.range=VK_WHOLE_SIZE},
+            {.buffer=G.gdn_ba.buf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdn_st[layer],.range=VK_WHOLE_SIZE},
+            {.buffer=G.gdn_y.buf,.range=VK_WHOLE_SIZE}};
+        wr_desc(G.dset_gdncv, 5, bd);
+        VkDescriptorBufferInfo bo[4] = {
+            {.buffer=G.gdn_y.buf,.range=VK_WHOLE_SIZE}, {.buffer=out_t->wbuf,.range=VK_WHOLE_SIZE},
+            {.buffer=out_t->sbuf,.range=VK_WHOLE_SIZE}, {.buffer=G.y.buf,.range=VK_WHOLE_SIZE}};
+        wr_desc(G.gdnf_out, 4, bo);
+
+        VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+
+        for (int i = 0; i < n; i++) {
+            VkBufferCopy cx = {.srcOffset = (VkDeviceSize)i * x1, .dstOffset = 0, .size = x1};
+            VkBufferCopy cp = {.srcOffset = (VkDeviceSize)i * pr1, .dstOffset = 0, .size = pr1};
+            vkCmdCopyBuffer(G.cmd, G.route_x.buf, G.x.buf, 1, &cx);
+            vkCmdCopyBuffer(G.cmd, G.gdnf_pr.buf, G.gdn_ba.buf, 1, &cp);
+            vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_t2c, 0, NULL, 0, NULL);
+
+            vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+            vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gdnf_gqkv, 0, NULL);
+            struct PC pq = {gqkv_t->fmt, 1, D, conv_dim, gqkv_t->rowWords, gqkv_t->gs};
+            vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pq), &pq);
+            vkCmdDispatch(G.cmd, (uint32_t)((conv_dim + 7) / 8), 1, 1);
+            vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gdnf_gz, 0, NULL);
+            struct PC pz = {gz_t->fmt, 1, D, value_dim, gz_t->rowWords, gz_t->gs};
+            vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pz), &pz);
+            vkCmdDispatch(G.cmd, (uint32_t)((value_dim + 7) / 8), 1, 1);
+            vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_c, 0, NULL, 0, NULL);
+
+            vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gdnconv);
+            vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gdnconv, 0, 1, &G.dset_gdnconv, 0, NULL);
+            struct PCConv pcv = {conv_dim, conv_k};
+            vkCmdPushConstants(G.cmd, G.plyt_gdnconv, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcv), &pcv);
+            vkCmdDispatch(G.cmd, (uint32_t)((conv_dim + 255) / 256), 1, 1);
+            vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_c, 0, NULL, 0, NULL);
+
+            vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gdncv);
+            vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gdncv, 0, 1, &G.dset_gdncv, 0, NULL);
+            struct PCGdnCv pd = {(uint32_t)KH, (uint32_t)KD, (uint32_t)VH, (uint32_t)VD, (uint32_t)key_dim, eps};
+            vkCmdPushConstants(G.cmd, G.plyt_gdncv, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
+            vkCmdDispatch(G.cmd, (uint32_t)VH, 1, 1);
+            vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_c, 0, NULL, 0, NULL);
+
+            vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+            vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gdnf_out, 0, NULL);
+            struct PC po = {out_t->fmt, 1, value_dim, Dout, out_t->rowWords, out_t->gs};
+            vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(po), &po);
+            vkCmdDispatch(G.cmd, (uint32_t)((Dout + 7) / 8), 1, 1);
+
+            vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb_c2t, 0, NULL, 0, NULL);
+            VkBufferCopy cy = {.srcOffset = 0, .dstOffset = (VkDeviceSize)i * y1, .size = y1};
+            vkCmdCopyBuffer(G.cmd, G.y.buf, G.y2.buf, 1, &cy);
+            if (i + 1 < n)
+                vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb_t2c, 0, NULL, 0, NULL);
+        }
+        VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+        VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+        VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+        if (vk_fence_wait_loud(G.fence, "gdn_full_seq") != VK_SUCCESS) { G.ready = 0; return 0; }
+        memcpy(out + (int64_t)s0 * Dout, G.y2.ptr, yb);
+        G.cmd_ready = 0; G.bound_tensor = NULL;
+    }
+    { static int once;
+      if (!once) { fprintf(stderr, "[VK] GDN prefill seq ENABLED (chunk=%d tokens/submit)\n", GDN_SEQ_CHUNK); once = 1; } }
     return 1;
 }
 

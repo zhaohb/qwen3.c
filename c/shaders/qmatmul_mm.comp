@@ -1,0 +1,133 @@
+#version 450
+// Prefill multi-row dense GEMM (ncnn gemm / llama mul_mm idea):
+// one WG owns BM activation rows and reuses each weight row across them.
+// Same bindings + PC as qmatmul.comp. Host sets Y = ceil(S/BM);
+// BM is derived from I: 4 if I<=2048, 2 if I<=4096 (xsh budget 32 KB).
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer X  { float x[]; };
+layout(std430, binding = 1) readonly  buffer W  { uint  w[]; };
+layout(std430, binding = 2) readonly  buffer Sc { float scale[]; };
+layout(std430, binding = 3) writeonly buffer Y  { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt, S, I, O, rowWords, gs;
+} p;
+
+#define BM_MAX 4
+shared float xsh[8192];   /* BM_MAX*2048 or 2*4096 */
+
+float i8(uint word, int lane) {
+    int b = int((word >> (uint(lane) * 8u)) & 0xffu);
+    if (b >= 128) b -= 256;
+    return float(b);
+}
+float i4(uint word, int lane) {
+    return float(int((word >> (uint(lane) * 4u)) & 0xfu) - 8);
+}
+
+void main() {
+    int bm = p.I > 2048 ? 2 : 4;
+    if (bm * p.I > 8192) return;
+    int s0 = int(gl_WorkGroupID.y) * bm;
+    int n = p.S - s0; if (n > bm) n = bm;
+    if (n <= 0) return;
+
+    int tid = int(gl_LocalInvocationID.x), nth = int(gl_WorkGroupSize.x);
+    for (int bi = 0; bi < n; bi++) {
+        int xoff = (s0 + bi) * p.I;
+        for (int i = tid; i < p.I; i += nth) xsh[bi * p.I + i] = x[xoff + i];
+    }
+    barrier();
+
+    int lane = int(gl_SubgroupInvocationID), sgsize = int(gl_SubgroupSize);
+    int sg = int(gl_SubgroupID), nsg = nth / sgsize;
+    int stride = int(gl_NumWorkGroups.x) * nsg;
+
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
+        uint rowBase = uint(o) * uint(p.rowWords);
+        float acc[BM_MAX];
+        for (int bi = 0; bi < BM_MAX; bi++) acc[bi] = 0.0;
+
+        if (p.fmt == 1) {
+            int words = (p.I + 3) / 4;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
+                for (int bi = 0; bi < n; bi++)
+                    for (int k = 0; k < 4; k++) {
+                        int i = i0 + k; if (i < p.I) acc[bi] += xsh[bi * p.I + i] * i8(pk, k);
+                    }
+            }
+        } else if (p.fmt == 6) {
+            int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng) * 2u;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                uint g = uint(i0 / p.gs);
+                float sc = scale[sb + g * 2u], zr = scale[sb + g * 2u + 1u];
+                for (int bi = 0; bi < n; bi++) {
+                    float awn = 0.0, ax = 0.0;
+                    for (int k = 0; k < 8; k++) {
+                        int i = i0 + k;
+                        if (i < p.I) {
+                            float xv = xsh[bi * p.I + i];
+                            awn += xv * (i4(pk, k) + 8.0); ax += xv;
+                        }
+                    }
+                    acc[bi] += sc * (awn - zr * ax);
+                }
+            }
+        } else if (p.fmt == 4) {
+            int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng);
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                float sc = scale[sb + uint(i0 / p.gs)];
+                for (int bi = 0; bi < n; bi++) {
+                    float a = 0.0;
+                    for (int k = 0; k < 8; k++) {
+                        int i = i0 + k; if (i < p.I) a += xsh[bi * p.I + i] * i4(pk, k);
+                    }
+                    acc[bi] += a * sc;
+                }
+            }
+        } else if (p.fmt == 5) {
+            int ng = (p.I + 63) >> 6;
+            uint sb = uint(o) * uint(ng);
+            for (int m = lane; m < ng * 4; m += sgsize) {
+                int g = m >> 2, mw = m & 3;
+                uint blo = w[rowBase + uint(g) * 6u + uint(mw)];
+                uint bhi = w[rowBase + uint(g) * 6u + 4u + uint(mw >> 1)];
+                int hs = (mw & 1) * 16, i0 = (g << 6) + (mw << 4);
+                float sc = scale[sb + uint(g)];
+                for (int bi = 0; bi < n; bi++) {
+                    float a = 0.0;
+                    for (int k = 0; k < 16; k++) {
+                        int i = i0 + k;
+                        if (i < p.I) {
+                            uint u = ((blo >> uint(k * 2)) & 3u) | (((bhi >> uint(hs + k)) & 1u) << 2);
+                            a += xsh[bi * p.I + i] * float(int(u) - 4);
+                        }
+                    }
+                    acc[bi] += a * sc;
+                }
+            }
+        } else { /* int4 fmt=2 */
+            int words = (p.I + 7) / 8;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                for (int bi = 0; bi < n; bi++)
+                    for (int k = 0; k < 8; k++) {
+                        int i = i0 + k; if (i < p.I) acc[bi] += xsh[bi * p.I + i] * i4(pk, k);
+                    }
+            }
+        }
+
+        int scaled = (p.fmt != 5 && p.fmt != 4 && p.fmt != 6) ? 1 : 0;
+        for (int bi = 0; bi < n; bi++) {
+            float tot = subgroupAdd(acc[bi]);
+            if (lane == 0) y[(s0 + bi) * p.O + o] = scaled != 0 ? tot * scale[o] : tot;
+        }
+    }
+}

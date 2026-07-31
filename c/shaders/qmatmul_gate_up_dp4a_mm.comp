@@ -1,0 +1,76 @@
+#version 450
+// Prefill multi-row DP4A gate+up+SiLU (llama.cpp mul_mmq / ncnn gemm idea):
+// one workgroup owns BM activation rows and reuses each weight row across them,
+// cutting int4 weight traffic ~BM× vs the per-row GEMV kernel.
+// Same bindings/PC as qmatmul_gate_up_dp4a.comp; dispatch Y = ceil(S/BM).
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_integer_dot_product : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer XQ { uint xq[]; };
+layout(std430, binding = 1) readonly  buffer XS { float xs[]; };
+layout(std430, binding = 2) readonly  buffer WG { uint wg[]; };
+layout(std430, binding = 3) readonly  buffer SG { float gscale[]; };
+layout(std430, binding = 4) readonly  buffer WU { uint wu[]; };
+layout(std430, binding = 5) readonly  buffer SU { float uscale[]; };
+layout(std430, binding = 6) writeonly buffer H  { float hid[]; };
+
+layout(push_constant) uniform P { int S, I, O, rowWords, gs, sbase; } p;
+
+#define BM 8
+shared uint xsh[4096];   /* BM * (I/4), I <= 2048 */
+
+int pkn(uint w) {
+    return int((w & 0xfu) | (((w >> 4) & 0xfu) << 8) | (((w >> 8) & 0xfu) << 16) | (((w >> 12) & 0xfu) << 24));
+}
+
+void main() {
+    int s0 = int(gl_WorkGroupID.y) * BM;
+    int n = p.S - s0; if (n > BM) n = BM;
+    if (n <= 0) return;
+    int tid = int(gl_LocalInvocationID.x), xwords = (p.I + 3) / 4;
+    if (n * xwords > 4096) return;   /* host must gate I */
+
+    for (int bi = 0; bi < n; bi++) {
+        int row = p.sbase + s0 + bi;
+        for (int i = tid; i < xwords; i += 256)
+            xsh[bi * xwords + i] = xq[row * xwords + i];
+    }
+    barrier();
+
+    int lane = int(gl_SubgroupInvocationID), sgsize = int(gl_SubgroupSize);
+    int sg = int(gl_SubgroupID), nsg = 256 / sgsize, stride = int(gl_NumWorkGroups.x) * nsg;
+    int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+    const int ONES = 0x01010101;
+    float xscale[BM];
+    for (int bi = 0; bi < n; bi++) xscale[bi] = xs[p.sbase + s0 + bi];
+
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
+        uint rb = uint(o) * uint(p.rowWords), sb = uint(o) * uint(ng) * 2u;
+        float g[BM], u[BM];
+        for (int bi = 0; bi < BM; bi++) { g[bi] = 0.0; u[bi] = 0.0; }
+
+        for (int wi = lane; wi < words; wi += sgsize) {
+            uint gp = wg[rb + uint(wi)], up = wu[rb + uint(wi)];
+            int gpk0 = pkn(gp), gpk1 = pkn(gp >> 16);
+            int upk0 = pkn(up), upk1 = pkn(up >> 16);
+            uint grp = uint(wi * 8 / p.gs) * 2u;
+            float gs_ = gscale[sb + grp], gz = gscale[sb + grp + 1u];
+            float us_ = uscale[sb + grp], uz = uscale[sb + grp + 1u];
+            for (int bi = 0; bi < n; bi++) {
+                uint xu0 = xsh[bi * xwords + 2 * wi];
+                uint xu1 = xsh[bi * xwords + 2 * wi + 1];
+                int gawn = dotPacked4x8EXT(int(xu0), gpk0) + dotPacked4x8EXT(int(xu1), gpk1);
+                int uawn = dotPacked4x8EXT(int(xu0), upk0) + dotPacked4x8EXT(int(xu1), upk1);
+                int ax   = dotPacked4x8EXT(int(xu0), ONES) + dotPacked4x8EXT(int(xu1), ONES);
+                g[bi] += gs_ * (float(gawn) - gz * float(ax));
+                u[bi] += us_ * (float(uawn) - uz * float(ax));
+            }
+        }
+        for (int bi = 0; bi < n; bi++) {
+            float gt = subgroupAdd(g[bi]) * xscale[bi];
+            float ut = subgroupAdd(u[bi]) * xscale[bi];
+            if (lane == 0) hid[(s0 + bi) * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;
+        }
+    }
+}

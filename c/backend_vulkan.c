@@ -77,7 +77,8 @@ static struct {
     uint32_t memtype_cached;     // HOST_CACHED — for buffers the CPU reads back (outputs)
     VkDescriptorSetLayout dsl;
     VkPipelineLayout plyt;
-    VkPipeline pipe;
+    VkPipeline pipe, pipe_mm;   /* pipe_mm: prefill multi-row dense GEMM (ncnn-style) */
+    VkShaderModule shader_mm;
     VkShaderModule shader;
     VkDescriptorPool dpool;
     VkDescriptorSet dset;
@@ -91,9 +92,10 @@ static struct {
     VkShaderModule shader_qr; VkDescriptorSetLayout dsl_qr; VkPipelineLayout plyt_qr;
     VkPipeline pipe_qr; VkDescriptorPool dpool_qr; VkDescriptorSet dset_qr_h, dset_qr_x;
     VkShaderModule shader_gu_dp4a; VkDescriptorSetLayout dsl_gu4; VkPipelineLayout plyt_gu4;
-    VkPipeline pipe_gu_dp4a; VkDescriptorPool dpool_gu4; VkDescriptorSet dset_gu4;
+    VkPipeline pipe_gu_dp4a, pipe_gu_dp4a_mm; VkDescriptorPool dpool_gu4; VkDescriptorSet dset_gu4;
     VkShaderModule shader_dn_dp4a; VkDescriptorSetLayout dsl_dn4; VkPipelineLayout plyt_dn4;
-    VkPipeline pipe_dn_dp4a; VkDescriptorPool dpool_dn4; VkDescriptorSet dset_dn4;
+    VkPipeline pipe_dn_dp4a, pipe_dn_dp4a_mm; VkDescriptorPool dpool_dn4; VkDescriptorSet dset_dn4;
+    VkShaderModule shader_gu_dp4a_mm, shader_dn_dp4a_mm;
     VkDescriptorSet eg_gu4[64], eg_dn4[64];
     Scratch eg_xq, eg_xs, eg_hq, eg_hs;   /* int8 activation/hidden + their per-row scales */
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
@@ -149,6 +151,10 @@ static struct {
      * descriptor sets (gate_up: dsl_gu, down: dsl), so gate_up->down runs on-device in
      * one submit with hidden never leaving the GPU. */
     Scratch eg_x, eg_h, eg_y;
+    Scratch eg_src, eg_tok;          /* MUL_MAT_ID gather: xs[S,D] + tok_ids[total] */
+    int eg_id_S, eg_id_D;            /* bound by coli_vk_eg_xs_bind */
+    VkShaderModule shader_gather; VkDescriptorSetLayout dsl_gather; VkPipelineLayout plyt_gather;
+    VkPipeline pipe_gather; VkDescriptorPool dpool_gather; VkDescriptorSet dset_gather;
     VkDescriptorPool eg_pool; VkDescriptorSet eg_gu[64], eg_dn[64]; int eg_nsets;
     /* expert-group ASYNC state: its own command buffer + fence so an in-flight group
      * never collides with the main cmd/fence (dense matmuls, absorb) — issue() returns
@@ -259,7 +265,7 @@ static struct {
      * expert-called-repeatedly pattern). The synchronous fence wait each call means no
      * submission is ever in flight, so rebinding/re-recording only when something
      * actually changed is safe. */
-    ColiVkTensor *bound_tensor; int bound_S, bound_I, bound_O, cmd_ready;
+    ColiVkTensor *bound_tensor; int bound_S, bound_I, bound_O, bound_mm, cmd_ready;
     VkBuffer bound_xbuf, bound_ybuf;
     size_t used_bytes, tensor_count;
     /* VRAM pressure-proofing: with VK_EXT_memory_priority the attention working set
@@ -272,6 +278,25 @@ static struct {
 } G;
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
+
+/* ncnn-style dense multi-row: BM=4 for I<=2048, BM=2 for I<=4096 (32 KB xsh). */
+static int qmatmul_bm(int I) {
+    if (I <= 2048) return 4;
+    if (I <= 4096) return 2;
+    return 0;
+}
+static int qmatmul_use_mm(int S, int I) {
+    return G.pipe_mm && S >= 4 && qmatmul_bm(I) > 0;
+}
+static void qmatmul_dispatch(VkCommandBuffer cmd, VkDescriptorSet dset, const struct PC *pc) {
+    int bm = qmatmul_bm(pc->I);
+    int use = qmatmul_use_mm(pc->S, pc->I);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, use ? G.pipe_mm : G.pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &dset, 0, NULL);
+    vkCmdPushConstants(cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*pc), pc);
+    uint32_t gy = use ? (uint32_t)((pc->S + bm - 1) / bm) : (uint32_t)pc->S;
+    vkCmdDispatch(cmd, (uint32_t)((pc->O + 7) / 8), gy, 1);
+}
 /* Push constants of the row-quantize and the two DP4A expert kernels. sbase indexes the
  * shared int8 activation + per-row scale buffers, which are bound whole (a 4B-granular
  * scale slice cannot meet minStorageBufferOffsetAlignment); only the outputs are sliced. */
@@ -295,6 +320,7 @@ struct PCGdnCv { uint32_t KH, KD, VH, VD, key_dim; float eps; };  /* gdn_delta_c
 /* Push constants of the GQA q/k-norm+rope+KV-write kernel (must match gqa_qkv.comp). */
 struct PCQkv { int S, H, KH, hd, rot, pos_base, max_t; float eps, theta; };
 struct PCRep { int count, D; };
+struct PCGather { int total, D, S; };
 struct PCGdp { int VH, VD; };
 /* softmax_topk.comp: do_pack writes moe_w[0..K) (+ shared gate at K when D>0). */
 struct PCTopk { int E, K, base, D, do_pack; };
@@ -669,6 +695,21 @@ int coli_vk_init(const char *spv_path) {
     G.shader = load_spv(spv_path);
     if (!G.shader) return 0;
     if (!build_pipeline(4, sizeof(struct PC), G.shader, &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) return 0;
+    /* Prefill dense multi-row GEMM (ncnn gemm weight reuse); shares dsl/plyt with qmatmul. */
+    {
+        char mm_path[512];
+        derive_dir_file(spv_path, "qmatmul_mm.spv", mm_path, sizeof(mm_path));
+        G.shader_mm = load_spv(mm_path);
+        if (G.shader_mm) {
+            VkComputePipelineCreateInfo cpi = {
+                .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                          .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = G.shader_mm, .pName = "main"},
+                .layout = G.plyt};
+            VKCHECK(vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &G.pipe_mm), "qmatmul_mm");
+            fprintf(stderr, "[VK] dense multi-row GEMM loaded (ncnn-style BM=2/4)\n");
+        }
+    }
 
     /* Optional fused gate+up pipeline: skip gracefully if its shader isn't present
      * (single-matmul path keeps working). */
@@ -695,8 +736,27 @@ int coli_vk_init(const char *spv_path) {
                                 &G.pipe_dn_dp4a, &G.dpool_dn4, &G.dset_dn4))
                 return 0;
             fprintf(stderr, "[VK] DP4A expert kernels loaded (int4 gate/up/down)\n");
+            /* Prefill multi-row GEMM variants (BM=8): same layouts, weight reuse across rows. */
+            char gumm_path[512], dnmm_path[512];
+            derive_dir_file(spv_path, "qmatmul_gate_up_dp4a_mm.spv", gumm_path, sizeof(gumm_path));
+            derive_dir_file(spv_path, "qmatmul_down_dp4a_mm.spv", dnmm_path, sizeof(dnmm_path));
+            G.shader_gu_dp4a_mm = load_spv(gumm_path);
+            G.shader_dn_dp4a_mm = load_spv(dnmm_path);
+            if (G.shader_gu_dp4a_mm && G.shader_dn_dp4a_mm) {
+                VkComputePipelineCreateInfo cpi = {
+                    .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                    .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                              .stage = VK_SHADER_STAGE_COMPUTE_BIT, .pName = "main"},
+                    .layout = G.plyt_gu4};
+                cpi.stage.module = G.shader_gu_dp4a_mm;
+                VKCHECK(vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &G.pipe_gu_dp4a_mm), "gu_mm");
+                cpi.layout = G.plyt_dn4; cpi.stage.module = G.shader_dn_dp4a_mm;
+                VKCHECK(vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &G.pipe_dn_dp4a_mm), "dn_mm");
+                fprintf(stderr, "[VK] DP4A multi-row GEMM loaded (BM=8, prefill weight reuse)\n");
+            }
         } else {
             G.pipe_qr = VK_NULL_HANDLE; G.pipe_gu_dp4a = VK_NULL_HANDLE; G.pipe_dn_dp4a = VK_NULL_HANDLE;
+            G.pipe_gu_dp4a_mm = VK_NULL_HANDLE; G.pipe_dn_dp4a_mm = VK_NULL_HANDLE;
         }
     }
 
@@ -793,6 +853,20 @@ int coli_vk_init(const char *spv_path) {
         } else {
             G.pipe_rep = VK_NULL_HANDLE; G.pipe_macc = VK_NULL_HANDLE;
             G.pipe_gdp = VK_NULL_HANDLE; G.pipe_topk = VK_NULL_HANDLE;
+        }
+    }
+    /* Prefill MoE gather (MUL_MAT_ID compact): optional; absence keeps host xg pack. */
+    {
+        char gath_path[512];
+        derive_dir_file(spv_path, "gather_rows.spv", gath_path, sizeof(gath_path));
+        G.shader_gather = load_spv(gath_path);
+        if (G.shader_gather &&
+            build_pipeline(3, sizeof(struct PCGather), G.shader_gather, &G.dsl_gather, &G.plyt_gather,
+                           &G.pipe_gather, &G.dpool_gather, &G.dset_gather))
+            fprintf(stderr, "[VK] MoE MUL_MAT_ID gather loaded (xs once + tok_ids compact)\n");
+        else {
+            G.pipe_gather = VK_NULL_HANDLE;
+            if (G.shader_gather) { vkDestroyShaderModule(G.dev, G.shader_gather, NULL); G.shader_gather = VK_NULL_HANDLE; }
         }
     }
     if (G.moe_ix_hw && G.pipe_macc && G.pipe_topk) {
@@ -1177,19 +1251,21 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     /* Re-record the command buffer only when the binding or the dispatch shape changed.
      * Recorded WITHOUT one-time-submit so the same buffer can be resubmitted verbatim —
      * for repeated calls to the same expert this drops setup to a bare submit+wait. */
-    if (rebind || !G.cmd_ready || G.bound_S != S || G.bound_I != I || G.bound_O != O) {
+    if (rebind || !G.cmd_ready || G.bound_S != S || G.bound_I != I || G.bound_O != O ||
+        G.bound_mm != qmatmul_use_mm(S, I)) {
         VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
-        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
         struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
-        vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
-         * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width. */
-        vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)S, 1);
+        qmatmul_dispatch(G.cmd, G.dset, &pc);
         VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
         G.cmd_ready = 1; G.bound_S = S; G.bound_I = I; G.bound_O = O;
+        G.bound_mm = qmatmul_use_mm(S, I);
+        { static int once;
+          if (!once && G.bound_mm) {
+              fprintf(stderr, "[VK] dense multi-row GEMM ENABLED (prefill S>=4)\n");
+              once = 1;
+          } }
     }
     if (G.eg_prof) { tA = vk_now(); p_rec += tA - t0; t0 = tA; }
 
@@ -1334,15 +1410,24 @@ int coli_vk_matmul_argmax(ColiVkTensor **tensor, const void *weights, const floa
  * Mirrors coli_cuda_expert_group. Split into prepare+submit / take so the caller can
  * overlap the GPU batch with its own CPU share (issue -> CPU rows -> take); the group
  * runs on its OWN command buffer + fence, so in-flight work never collides with the
- * main pipeline (dense matmuls, absorb attention). Returns 0 -> caller falls back. */
+ * main pipeline (dense matmuls, absorb attention).
+ *
+ * tok_ids != NULL: llama.cpp MUL_MAT_ID compact — xs already in G.eg_src via
+ * coli_vk_eg_xs_bind; GPU gathers packed rows into eg_x (x may be NULL).
+ * tok_ids == NULL: classic path — memcpy packed x into eg_x. */
 static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                              ColiVkTensor *const *downs, const int *rows, int count,
-                             const float *x) {
+                             const float *x, const int *tok_ids) {
     int dbg = g_qwen_opts.eg_dbg != 0;
     if (!G.ready || !G.shader_gu || count < 1 || count > 64) { if (dbg) fprintf(stderr,"[eg] reject: ready=%d shader_gu=%p count=%d\n",G.ready,(void*)G.shader_gu,count); return 0; }
+    if (tok_ids && (!G.pipe_gather || G.eg_id_S < 1 || G.eg_id_D < 1 || !G.eg_src.buf)) {
+        if (dbg) fprintf(stderr,"[eg] reject: gather path unavailable\n"); return 0;
+    }
+    if (!tok_ids && !x) { if (dbg) fprintf(stderr,"[eg] reject: no x\n"); return 0; }
     ColiVkTensor *g0 = gates[0]; if (!g0) { if (dbg) fprintf(stderr,"[eg] reject: g0 NULL\n"); return 0; }
     int D = g0->I, I = g0->O, fmt = g0->fmt, total = 0, off[64];
     if (D > 6144) { if (dbg) fprintf(stderr,"[eg] reject: D=%d>6144\n",D); return 0; }   /* gate_up shader stages x in xsh[6144] */
+    if (tok_ids && D != G.eg_id_D) { if (dbg) fprintf(stderr,"[eg] reject: D=%d != bound %d\n",D,G.eg_id_D); return 0; }
     int dfmt = downs[0]->fmt;   /* down may be a different quant than gate/up (per-projection
                                  * containers, e.g. --up-bits 3); gate/up must MATCH — the
                                  * fused gate_up shader decodes both with one fmt. */
@@ -1357,26 +1442,26 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         }
     }
     size_t xb = (size_t)total*D*4, hb = (size_t)total*I*4, yb = (size_t)total*D*4;
+    size_t idb = (size_t)total * sizeof(int); if (idb < 256) idb = 256;
     if (!scratch_reserve(&G.eg_x, xb) || !scratch_reserve(&G.eg_h, hb) ||
         !scratch_reserve_mt(&G.eg_y, yb, G.memtype_cached)) return 0;   /* eg_y is read back -> cached */
+    if (tok_ids && !scratch_reserve(&G.eg_tok, idb)) return 0;
     G.eg_prof = g_qwen_opts.vk_prof != 0;
     if (G.eg_prof) G.eg_t0 = vk_now();
-    memcpy(G.eg_x.ptr, x, xb);
+    if (tok_ids) memcpy(G.eg_tok.ptr, tok_ids, (size_t)total * sizeof(int));
+    else         memcpy(G.eg_x.ptr, x, xb);
     if (G.eg_prof) G.eg_t1 = vk_now();
 
     /* DP4A: quantize each activation row to int8 on-device, then let the integer-dot
      * kernels replace the scalar ones. gate_up and down are gated separately because a
      * container may quantize the two projections differently.
      *
-     * OPT-IN (COLI_VK_DP4A=1), because it does not pay off as the decode path stands:
-     * every expert here gets rows=1 (moe_token runs per token), so both matmuls are
-     * mat-VECs reading ~13 MB of int4 weights per group — already at ~40 of the ~48 GB/s
-     * this iGPU sustains. DP4A removes ALU work, not bytes, so measured on Qwen3.5-35B-A3B
-     * it moved the group from 0.327 to 0.317 ms (3%) and the end-to-end rate from 11.06 to
-     * 11.15 tok/s, while int8 activations cost ~2.7% perplexity. It becomes worthwhile only
-     * once several tokens' rows share one expert (rows>1 amortizes the weight stream and
-     * turns these kernels ALU-bound), which is what batching prefill per expert would do. */
-    int dp4a_on = G.pipe_qr && g_qwen_opts.dp4a != 0;
+     * Decode (rows=1) stays opt-in via --dp4a: mat-vecs are bandwidth-bound so DP4A
+     * barely helps. Prefill expert batches (rows>1) amortize the weight stream and
+     * become ALU-bound — auto-enable there (llama.cpp MUL_MAT_ID / grouped GEMM idea). */
+    int max_rows = 0;
+    for (int c = 0; c < count; c++) if (rows[c] > max_rows) max_rows = rows[c];
+    int dp4a_on = G.pipe_qr && (g_qwen_opts.dp4a != 0 || max_rows > 1);
     int dp4a = dp4a_on && fmt == 6 && D <= 6144;         /* gate_up stages x in xsh[1536] */
     int dp4a_dn = dp4a_on && dfmt == 6 && I <= 8192;     /* down stages hidden in xsh[2048] */
     size_t sb_min = (size_t)total * 4 < 256 ? 256 : (size_t)total * 4;
@@ -1447,12 +1532,28 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
                                         {G.eg_hs.buf, 0, VK_WHOLE_SIZE}};
         wr_desc(G.dset_qr_h, 3, qh);
     }
+    if (tok_ids) {
+        VkDescriptorBufferInfo bg[3] = {
+            {G.eg_src.buf, 0, VK_WHOLE_SIZE},
+            {G.eg_tok.buf, 0, VK_WHOLE_SIZE},
+            {G.eg_x.buf, 0, (VkDeviceSize)xb}};
+        wr_desc(G.dset_gather, 3, bg);
+    }
     if (G.eg_prof) G.eg_t2 = vk_now();
 
     VKCHECK(vkResetCommandBuffer(G.eg_cmd, 0), "eg resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.eg_cmd, &begin), "eg beginCmd");
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    /* phase -1: MUL_MAT_ID gather xs[tok_ids] → packed eg_x */
+    if (tok_ids) {
+        struct PCGather pg = {total, D, G.eg_id_S};
+        vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gather);
+        vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gather, 0, 1, &G.dset_gather, 0, NULL);
+        vkCmdPushConstants(G.eg_cmd, G.plyt_gather, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pg), &pg);
+        vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 255) / 256), (uint32_t)total, 1);
+        vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
     /* phase 0: x -> int8 + per-row scale (all rows in one dispatch) */
     if (dp4a) {
         struct PCQr qr = {total, D};
@@ -1463,18 +1564,35 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
     /* phase 1: fused gate+up+silu -> hidden (per expert, bound to its x/hidden slices) */
-    vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dp4a ? G.pipe_gu_dp4a : G.pipe_gu);
+    #define EG_MM_BM 8
+    int mm_gu = dp4a && G.pipe_gu_dp4a_mm && D <= 2048;
+    int mm_dn = dp4a_dn && G.pipe_dn_dp4a_mm && I <= 2048;
+    { static int once;
+      if (!once && (mm_gu || mm_dn)) {
+          fprintf(stderr, "[VK] MoE prefill DP4A multi-row GEMM ENABLED (BM=%d)\n", EG_MM_BM);
+          once = 1;
+      } }
     for (int c = 0; c < count; c++) {
-        if (dp4a) {
+        int use_mm = mm_gu && rows[c] >= 4;
+        if (use_mm) {
             struct PCDp4a pc = {rows[c], D, I, gates[c]->rowWords, gates[c]->gs, off[c]};
+            vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu_dp4a_mm);
             vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu4, 0, 1, &G.eg_gu4[c], 0, NULL);
             vkCmdPushConstants(G.eg_cmd, G.plyt_gu4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)((rows[c] + EG_MM_BM - 1) / EG_MM_BM), 1);
         } else {
-            struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
-            vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
-            vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dp4a ? G.pipe_gu_dp4a : G.pipe_gu);
+            if (dp4a) {
+                struct PCDp4a pc = {rows[c], D, I, gates[c]->rowWords, gates[c]->gs, off[c]};
+                vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu4, 0, 1, &G.eg_gu4[c], 0, NULL);
+                vkCmdPushConstants(G.eg_cmd, G.plyt_gu4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            } else {
+                struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
+                vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
+                vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            }
+            vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
         }
-        vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
     }
     vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     /* phase 1.5: hidden -> int8 + per-row scale, feeding the DP4A down kernel */
@@ -1487,19 +1605,29 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
     /* phase 2: down projection hidden -> y */
-    vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dp4a_dn ? G.pipe_dn_dp4a : G.pipe);
     for (int c = 0; c < count; c++) {
-        if (dp4a_dn) {
+        int use_mm = mm_dn && rows[c] >= 4;
+        if (use_mm) {
             struct PCDp4a pc = {rows[c], I, D, downs[c]->rowWords, downs[c]->gs, off[c]};
+            vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dn_dp4a_mm);
             vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dn4, 0, 1, &G.eg_dn4[c], 0, NULL);
             vkCmdPushConstants(G.eg_cmd, G.plyt_dn4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)((rows[c] + EG_MM_BM - 1) / EG_MM_BM), 1);
         } else {
-            struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
-            vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
-            vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dp4a_dn ? G.pipe_dn_dp4a : G.pipe);
+            if (dp4a_dn) {
+                struct PCDp4a pc = {rows[c], I, D, downs[c]->rowWords, downs[c]->gs, off[c]};
+                vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dn4, 0, 1, &G.eg_dn4[c], 0, NULL);
+                vkCmdPushConstants(G.eg_cmd, G.plyt_dn4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            } else {
+                struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
+                vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
+                vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            }
+            vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
         }
-        vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
     }
+    #undef EG_MM_BM
     VKCHECK(vkEndCommandBuffer(G.eg_cmd), "eg endCmd");
     if (G.eg_prof) G.eg_t3 = vk_now();
 
@@ -1518,7 +1646,27 @@ int coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *
                                ColiVkTensor *const *downs, const int *rows, int count,
                                const float *x) {
     if (G.eg_inflight) return 0;
-    return eg_prepare_submit(gates, ups, downs, rows, count, x);
+    return eg_prepare_submit(gates, ups, downs, rows, count, x, NULL);
+}
+
+int coli_vk_eg_gather_available(void) { return G.ready && G.pipe_gather ? 1 : 0; }
+
+int coli_vk_eg_xs_bind(const float *xs, int S, int D) {
+    if (!coli_vk_eg_gather_available() || !xs || S < 1 || D < 1) return 0;
+    size_t xb = (size_t)S * (size_t)D * 4;
+    if (!scratch_reserve(&G.eg_src, xb)) return 0;
+    memcpy(G.eg_src.ptr, xs, xb);
+    G.eg_id_S = S; G.eg_id_D = D;
+    { static int once;
+      if (!once) { fprintf(stderr, "[VK] MoE MUL_MAT_ID gather ENABLED (xs bind + tok_ids compact)\n"); once = 1; } }
+    return 1;
+}
+
+int coli_vk_expert_group_issue_id(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                  ColiVkTensor *const *downs, const int *rows, int count,
+                                  const int *tok_ids) {
+    if (G.eg_inflight || !tok_ids) return 0;
+    return eg_prepare_submit(gates, ups, downs, rows, count, NULL, tok_ids);
 }
 
 /* Join the in-flight group and read back the packed outputs. */
@@ -1544,7 +1692,7 @@ int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                          ColiVkTensor *const *downs, const int *rows, int count,
                          float *y, const float *x) {
     if (G.eg_inflight) return 0;
-    if (!eg_prepare_submit(gates, ups, downs, rows, count, x)) return 0;
+    if (!eg_prepare_submit(gates, ups, downs, rows, count, x, NULL)) return 0;
     return coli_vk_expert_group_take(y);
 }
 
@@ -1866,12 +2014,13 @@ int coli_vk_gdn_full(int layer, const float *x, int D, ColiVkTensor *gqkv_t, Col
     return 1;
 }
 
-/* Prefill GDN: pack up to GDN_SEQ_CHUNK tokens into one CB. Recurrent state stays
- * sequential via barriers; fences fall from one-per-token to one-per-chunk.
- * Descriptors stay fixed on single-token work buffers; each token is staged in via
- * vkCmdCopyBuffer from the host-uploaded batch (updating a bound set mid-CB would
- * make every dispatch see the last token's offsets). */
-#define GDN_SEQ_CHUNK 64
+/* Prefill GDN (llama.cpp / ncnn style: amortize weight traffic across S rows).
+ * Per chunk: one batched qkv + one batched z (S=n), then serial conv+delta (recurrent),
+ * then one batched out-proj. Fences: ceil(S/CHUNK) per layer; weight reads for projections
+ * drop from O(S) to O(1) per chunk. Decode S=1 still uses coli_vk_gdn_full. */
+/* Prefill GDN: larger chunk → fewer submit/fence pairs; serial conv+delta still
+ * walks tokens inside the CB. 256 fits ~20 MB scratch at D=2048 / conv_dim=8192. */
+#define GDN_SEQ_CHUNK 256
 
 int coli_vk_gdn_full_seq(int layer, const float *x, int S, int D,
                          ColiVkTensor *gqkv_t, ColiVkTensor *gz_t, const float *params,
@@ -1899,67 +2048,67 @@ int coli_vk_gdn_full_seq(int layer, const float *x, int S, int D,
     for (int s0 = 0; s0 < S; s0 += GDN_SEQ_CHUNK) {
         int n = S - s0; if (n > GDN_SEQ_CHUNK) n = GDN_SEQ_CHUNK;
         size_t xb = (size_t)n * D * 4, prb = (size_t)n * (size_t)pr_stride * 4;
-        size_t yb = (size_t)n * Dout * 4;
-        size_t x1 = (size_t)D * 4, pr1 = (size_t)pr_stride * 4, y1 = (size_t)Dout * 4;
-        /* batch uploads: route_x / y2 / gdnf_pr; single-token work: x / gdn_ba / y */
+        size_t qkvb = (size_t)n * (size_t)conv_dim * 4, zb = (size_t)n * (size_t)value_dim * 4;
+        size_t ybat = (size_t)n * (size_t)value_dim * 4, yb = (size_t)n * Dout * 4;
+        size_t q1 = (size_t)conv_dim * 4, z1 = (size_t)value_dim * 4;
+        size_t pr1 = (size_t)pr_stride * 4, y1 = (size_t)value_dim * 4;
+        /* batch: route_x=x, gdnf_qkv/z=proj outs, gdn_y=delta outs, y2=final out
+         * work (serial): att_delta=qkv row, gdn_bb=z row, gdn_ba=params, gdnf_cv, x=y row */
         if (!scratch_reserve(&G.route_x, xb) || !scratch_reserve(&G.gdnf_pr, prb) ||
-            !scratch_reserve_mt(&G.y2, yb, G.memtype_cached) ||
-            !scratch_reserve(&G.x, x1) || !scratch_reserve(&G.gdn_ba, pr1) ||
-            !scratch_reserve_mt(&G.y, y1, G.memtype_cached) ||
-            !scratch_reserve(&G.gdnf_qkv, (size_t)conv_dim * 4) ||
-            !scratch_reserve(&G.gdnf_z, (size_t)value_dim * 4) ||
-            !scratch_reserve(&G.gdnf_cv, (size_t)conv_dim * 4) ||
-            !scratch_reserve(&G.gdn_y, (size_t)value_dim * 4))
+            !scratch_reserve(&G.gdnf_qkv, qkvb) || !scratch_reserve(&G.gdnf_z, zb) ||
+            !scratch_reserve(&G.gdn_y, ybat) || !scratch_reserve_mt(&G.y2, yb, G.memtype_cached) ||
+            !scratch_reserve(&G.att_delta, q1) || !scratch_reserve(&G.gdn_bb, z1) ||
+            !scratch_reserve(&G.gdn_ba, pr1) || !scratch_reserve(&G.gdnf_cv, q1) ||
+            !scratch_reserve(&G.x, y1))
             return 0;
         memcpy(G.route_x.ptr, x + (int64_t)s0 * D, xb);
         memcpy(G.gdnf_pr.ptr, params + (int64_t)s0 * pr_stride, prb);
 
-        /* Bind once to fixed single-token work buffers. */
+        /* Fixed binds: batch projs + serial work + batch out. */
         VkDescriptorBufferInfo bqkv[4] = {
-            {.buffer=G.x.buf,.range=VK_WHOLE_SIZE}, {.buffer=gqkv_t->wbuf,.range=VK_WHOLE_SIZE},
+            {.buffer=G.route_x.buf,.range=VK_WHOLE_SIZE}, {.buffer=gqkv_t->wbuf,.range=VK_WHOLE_SIZE},
             {.buffer=gqkv_t->sbuf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdnf_qkv.buf,.range=VK_WHOLE_SIZE}};
         wr_desc(G.gdnf_gqkv, 4, bqkv);
         VkDescriptorBufferInfo bz[4] = {
-            {.buffer=G.x.buf,.range=VK_WHOLE_SIZE}, {.buffer=gz_t->wbuf,.range=VK_WHOLE_SIZE},
+            {.buffer=G.route_x.buf,.range=VK_WHOLE_SIZE}, {.buffer=gz_t->wbuf,.range=VK_WHOLE_SIZE},
             {.buffer=gz_t->sbuf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdnf_z.buf,.range=VK_WHOLE_SIZE}};
         wr_desc(G.gdnf_gz, 4, bz);
         VkDescriptorBufferInfo bc[4] = {
-            {.buffer=G.gdnf_qkv.buf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdn_cw[layer],.range=VK_WHOLE_SIZE},
+            {.buffer=G.att_delta.buf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdn_cw[layer],.range=VK_WHOLE_SIZE},
             {.buffer=G.gdn_ring[layer],.range=VK_WHOLE_SIZE}, {.buffer=G.gdnf_cv.buf,.range=VK_WHOLE_SIZE}};
         wr_desc(G.dset_gdnconv, 4, bc);
         VkDescriptorBufferInfo bd[5] = {
-            {.buffer=G.gdnf_cv.buf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdnf_z.buf,.range=VK_WHOLE_SIZE},
+            {.buffer=G.gdnf_cv.buf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdn_bb.buf,.range=VK_WHOLE_SIZE},
             {.buffer=G.gdn_ba.buf,.range=VK_WHOLE_SIZE}, {.buffer=G.gdn_st[layer],.range=VK_WHOLE_SIZE},
-            {.buffer=G.gdn_y.buf,.range=VK_WHOLE_SIZE}};
+            {.buffer=G.x.buf,.range=VK_WHOLE_SIZE}};
         wr_desc(G.dset_gdncv, 5, bd);
         VkDescriptorBufferInfo bo[4] = {
             {.buffer=G.gdn_y.buf,.range=VK_WHOLE_SIZE}, {.buffer=out_t->wbuf,.range=VK_WHOLE_SIZE},
-            {.buffer=out_t->sbuf,.range=VK_WHOLE_SIZE}, {.buffer=G.y.buf,.range=VK_WHOLE_SIZE}};
+            {.buffer=out_t->sbuf,.range=VK_WHOLE_SIZE}, {.buffer=G.y2.buf,.range=VK_WHOLE_SIZE}};
         wr_desc(G.gdnf_out, 4, bo);
 
         VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
 
+        /* 1) Batched qkv + z: ncnn-style multi-row GEMM when n>=4. */
+        struct PC pq = {gqkv_t->fmt, n, D, conv_dim, gqkv_t->rowWords, gqkv_t->gs};
+        qmatmul_dispatch(G.cmd, G.gdnf_gqkv, &pq);
+        struct PC pz = {gz_t->fmt, n, D, value_dim, gz_t->rowWords, gz_t->gs};
+        qmatmul_dispatch(G.cmd, G.gdnf_gz, &pz);
+        vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb_c2t, 0, NULL, 0, NULL);
+
+        /* 2) Serial conv + delta (ring/state recurrence). */
         for (int i = 0; i < n; i++) {
-            VkBufferCopy cx = {.srcOffset = (VkDeviceSize)i * x1, .dstOffset = 0, .size = x1};
+            VkBufferCopy cq = {.srcOffset = (VkDeviceSize)i * q1, .dstOffset = 0, .size = q1};
+            VkBufferCopy cz = {.srcOffset = (VkDeviceSize)i * z1, .dstOffset = 0, .size = z1};
             VkBufferCopy cp = {.srcOffset = (VkDeviceSize)i * pr1, .dstOffset = 0, .size = pr1};
-            vkCmdCopyBuffer(G.cmd, G.route_x.buf, G.x.buf, 1, &cx);
+            vkCmdCopyBuffer(G.cmd, G.gdnf_qkv.buf, G.att_delta.buf, 1, &cq);
+            vkCmdCopyBuffer(G.cmd, G.gdnf_z.buf, G.gdn_bb.buf, 1, &cz);
             vkCmdCopyBuffer(G.cmd, G.gdnf_pr.buf, G.gdn_ba.buf, 1, &cp);
             vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_t2c, 0, NULL, 0, NULL);
-
-            vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
-            vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gdnf_gqkv, 0, NULL);
-            struct PC pq = {gqkv_t->fmt, 1, D, conv_dim, gqkv_t->rowWords, gqkv_t->gs};
-            vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pq), &pq);
-            vkCmdDispatch(G.cmd, (uint32_t)((conv_dim + 7) / 8), 1, 1);
-            vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gdnf_gz, 0, NULL);
-            struct PC pz = {gz_t->fmt, 1, D, value_dim, gz_t->rowWords, gz_t->gs};
-            vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pz), &pz);
-            vkCmdDispatch(G.cmd, (uint32_t)((value_dim + 7) / 8), 1, 1);
-            vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_c, 0, NULL, 0, NULL);
 
             vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gdnconv);
             vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gdnconv, 0, 1, &G.dset_gdnconv, 0, NULL);
@@ -1974,23 +2123,21 @@ int coli_vk_gdn_full_seq(int layer, const float *x, int S, int D,
             struct PCGdnCv pd = {(uint32_t)KH, (uint32_t)KD, (uint32_t)VH, (uint32_t)VD, (uint32_t)key_dim, eps};
             vkCmdPushConstants(G.cmd, G.plyt_gdncv, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), &pd);
             vkCmdDispatch(G.cmd, (uint32_t)VH, 1, 1);
-            vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_c, 0, NULL, 0, NULL);
-
-            vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
-            vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gdnf_out, 0, NULL);
-            struct PC po = {out_t->fmt, 1, value_dim, Dout, out_t->rowWords, out_t->gs};
-            vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(po), &po);
-            vkCmdDispatch(G.cmd, (uint32_t)((Dout + 7) / 8), 1, 1);
 
             vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb_c2t, 0, NULL, 0, NULL);
             VkBufferCopy cy = {.srcOffset = 0, .dstOffset = (VkDeviceSize)i * y1, .size = y1};
-            vkCmdCopyBuffer(G.cmd, G.y.buf, G.y2.buf, 1, &cy);
+            vkCmdCopyBuffer(G.cmd, G.x.buf, G.gdn_y.buf, 1, &cy);
             if (i + 1 < n)
                 vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb_t2c, 0, NULL, 0, NULL);
         }
+
+        /* 3) Batched out-proj over all delta outputs. */
+        vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_t2c, 0, NULL, 0, NULL);
+        struct PC po = {out_t->fmt, n, value_dim, Dout, out_t->rowWords, out_t->gs};
+        qmatmul_dispatch(G.cmd, G.gdnf_out, &po);
         VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
 
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -2002,7 +2149,10 @@ int coli_vk_gdn_full_seq(int layer, const float *x, int S, int D,
         G.cmd_ready = 0; G.bound_tensor = NULL;
     }
     { static int once;
-      if (!once) { fprintf(stderr, "[VK] GDN prefill seq ENABLED (chunk=%d tokens/submit)\n", GDN_SEQ_CHUNK); once = 1; } }
+      if (!once) {
+          fprintf(stderr, "[VK] GDN prefill seq ENABLED (chunk=%d, batched qkv/z/out)\n", GDN_SEQ_CHUNK);
+          once = 1;
+      } }
     return 1;
 }
 
@@ -2162,19 +2312,12 @@ int coli_vk_gqa_full(int layer, const float *x, int D, ColiVkTensor *gq_t, ColiV
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-    /* 1) q/k/v matmuls (x -> qg, k, v) */
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    /* 1) q/k/v matmuls (x -> qg, k, v) — multi-row GEMM when S>=4 */
     struct PC pq = {gq_t->fmt, S, D, qo, gq_t->rowWords, gq_t->gs};
-    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gqaf_q, 0, NULL);
-    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pq), &pq);
-    vkCmdDispatch(G.cmd, (uint32_t)((qo + 7) / 8), (uint32_t)S, 1);
+    qmatmul_dispatch(G.cmd, G.gqaf_q, &pq);
     struct PC pk = {gk_t->fmt, S, D, ko, gk_t->rowWords, gk_t->gs};
-    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gqaf_k, 0, NULL);
-    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pk), &pk);
-    vkCmdDispatch(G.cmd, (uint32_t)((ko + 7) / 8), (uint32_t)S, 1);
-    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gqaf_v, 0, NULL);
-    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pk), &pk);
-    vkCmdDispatch(G.cmd, (uint32_t)((ko + 7) / 8), (uint32_t)S, 1);
+    qmatmul_dispatch(G.cmd, G.gqaf_k, &pk);
+    qmatmul_dispatch(G.cmd, G.gqaf_v, &pk);
     vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     /* 2) q/k-norm + rope + KV-mirror write */
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_qkv);
@@ -2191,11 +2334,8 @@ int coli_vk_gqa_full(int layer, const float *x, int D, ColiVkTensor *gq_t, ColiV
     vkCmdDispatch(G.cmd, (uint32_t)H, (uint32_t)S, 1);
     vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     /* 4) o projection (ctx -> out) */
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
-    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gqaf_out, 0, NULL);
     struct PC po = {out_t->fmt, S, H * hd, Dout, out_t->rowWords, out_t->gs};
-    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(po), &po);
-    vkCmdDispatch(G.cmd, (uint32_t)((Dout + 7) / 8), (uint32_t)S, 1);
+    qmatmul_dispatch(G.cmd, G.gqaf_out, &po);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
 
     VkSubmitInfo si2 = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
@@ -2328,18 +2468,11 @@ int coli_vk_gqa_full_route(int layer, const float *resid, int D,
     vkCmdDispatch(G.cmd, (uint32_t)S, 1, 1);
     vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     /* 1-4) same as gqa_full, but o-proj lands in att_delta (stays on device) */
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
     struct PC pq = {gq_t->fmt, S, D, qo, gq_t->rowWords, gq_t->gs};
-    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gqaf_q, 0, NULL);
-    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pq), &pq);
-    vkCmdDispatch(G.cmd, (uint32_t)((qo + 7) / 8), (uint32_t)S, 1);
+    qmatmul_dispatch(G.cmd, G.gqaf_q, &pq);
     struct PC pk = {gk_t->fmt, S, D, ko, gk_t->rowWords, gk_t->gs};
-    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gqaf_k, 0, NULL);
-    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pk), &pk);
-    vkCmdDispatch(G.cmd, (uint32_t)((ko + 7) / 8), (uint32_t)S, 1);
-    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gqaf_v, 0, NULL);
-    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pk), &pk);
-    vkCmdDispatch(G.cmd, (uint32_t)((ko + 7) / 8), (uint32_t)S, 1);
+    qmatmul_dispatch(G.cmd, G.gqaf_k, &pk);
+    qmatmul_dispatch(G.cmd, G.gqaf_v, &pk);
     vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_qkv);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_qkv, 0, 1, &G.dset_qkv, 0, NULL);
@@ -2353,11 +2486,8 @@ int coli_vk_gqa_full_route(int layer, const float *resid, int D,
     vkCmdPushConstants(G.cmd, G.plyt_gqa, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pg), &pg);
     vkCmdDispatch(G.cmd, (uint32_t)H, (uint32_t)S, 1);
     vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
-    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.gqaf_out, 0, NULL);
     struct PC po = {out_t->fmt, S, H * hd, Dout, out_t->rowWords, out_t->gs};
-    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(po), &po);
-    vkCmdDispatch(G.cmd, (uint32_t)((Dout + 7) / 8), (uint32_t)S, 1);
+    qmatmul_dispatch(G.cmd, G.gqaf_out, &po);
     /* 5) residual + post_ln + router */
     route_tail_record(router, ln_layer, S, D, E, eps);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -3805,15 +3935,10 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
     struct PC pc1 = {fmt, S, I, O1, t1->rowWords, t1->gs};
-    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
-    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc1), &pc1);
-    vkCmdDispatch(G.cmd, (uint32_t)((O1 + 7) / 8), (uint32_t)S, 1);
+    qmatmul_dispatch(G.cmd, G.dset, &pc1);
     struct PC pc2 = {fmt, S, I, O2, t2->rowWords, t2->gs};
-    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset_pair, 0, NULL);
-    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), &pc2);
-    vkCmdDispatch(G.cmd, (uint32_t)((O2 + 7) / 8), (uint32_t)S, 1);
+    qmatmul_dispatch(G.cmd, G.dset_pair, &pc2);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
@@ -4020,6 +4145,8 @@ void coli_vk_shutdown(void) {
     if (G.eg_x.buf) { vkDestroyBuffer(G.dev, G.eg_x.buf, NULL); vkFreeMemory(G.dev, G.eg_x.mem, NULL); }
     if (G.eg_h.buf) { vkDestroyBuffer(G.dev, G.eg_h.buf, NULL); vkFreeMemory(G.dev, G.eg_h.mem, NULL); }
     if (G.eg_y.buf) { vkDestroyBuffer(G.dev, G.eg_y.buf, NULL); vkFreeMemory(G.dev, G.eg_y.mem, NULL); }
+    if (G.eg_src.buf) { vkDestroyBuffer(G.dev, G.eg_src.buf, NULL); vkFreeMemory(G.dev, G.eg_src.mem, NULL); }
+    if (G.eg_tok.buf) { vkDestroyBuffer(G.dev, G.eg_tok.buf, NULL); vkFreeMemory(G.dev, G.eg_tok.mem, NULL); }
     if (G.eg_xq.buf) { vkDestroyBuffer(G.dev, G.eg_xq.buf, NULL); vkFreeMemory(G.dev, G.eg_xq.mem, NULL); }
     if (G.eg_xs.buf) { vkDestroyBuffer(G.dev, G.eg_xs.buf, NULL); vkFreeMemory(G.dev, G.eg_xs.mem, NULL); }
     if (G.eg_hq.buf) { vkDestroyBuffer(G.dev, G.eg_hq.buf, NULL); vkFreeMemory(G.dev, G.eg_hq.mem, NULL); }
@@ -4043,9 +4170,11 @@ void coli_vk_shutdown(void) {
     vkDestroyCommandPool(G.dev, G.cpool, NULL);
     vkDestroyDescriptorPool(G.dev, G.dpool, NULL);
     vkDestroyPipeline(G.dev, G.pipe, NULL);
+    if (G.pipe_mm) vkDestroyPipeline(G.dev, G.pipe_mm, NULL);
     vkDestroyPipelineLayout(G.dev, G.plyt, NULL);
     vkDestroyDescriptorSetLayout(G.dev, G.dsl, NULL);
     vkDestroyShaderModule(G.dev, G.shader, NULL);
+    if (G.shader_mm) vkDestroyShaderModule(G.dev, G.shader_mm, NULL);
     if (G.shader_gu) {
         vkDestroyDescriptorPool(G.dev, G.dpool_gu, NULL);
         vkDestroyPipeline(G.dev, G.pipe_gu, NULL);
@@ -4099,6 +4228,13 @@ void coli_vk_shutdown(void) {
         vkDestroyPipelineLayout(G.dev, G.plyt_rep, NULL);
         vkDestroyDescriptorSetLayout(G.dev, G.dsl_rep, NULL);
         vkDestroyShaderModule(G.dev, G.shader_rep, NULL);
+    }
+    if (G.pipe_gather) {
+        vkDestroyDescriptorPool(G.dev, G.dpool_gather, NULL);
+        vkDestroyPipeline(G.dev, G.pipe_gather, NULL);
+        vkDestroyPipelineLayout(G.dev, G.plyt_gather, NULL);
+        vkDestroyDescriptorSetLayout(G.dev, G.dsl_gather, NULL);
+        vkDestroyShaderModule(G.dev, G.shader_gather, NULL);
     }
     if (G.pipe_macc) {
         vkDestroyDescriptorPool(G.dev, G.dpool_macc, NULL);
@@ -4155,16 +4291,20 @@ void coli_vk_shutdown(void) {
         vkDestroyDescriptorSetLayout(G.dev, G.dsl_qr, NULL);
         vkDestroyDescriptorPool(G.dev, G.dpool_gu4, NULL);
         vkDestroyPipeline(G.dev, G.pipe_gu_dp4a, NULL);
+        if (G.pipe_gu_dp4a_mm) vkDestroyPipeline(G.dev, G.pipe_gu_dp4a_mm, NULL);
         vkDestroyPipelineLayout(G.dev, G.plyt_gu4, NULL);
         vkDestroyDescriptorSetLayout(G.dev, G.dsl_gu4, NULL);
         vkDestroyDescriptorPool(G.dev, G.dpool_dn4, NULL);
         vkDestroyPipeline(G.dev, G.pipe_dn_dp4a, NULL);
+        if (G.pipe_dn_dp4a_mm) vkDestroyPipeline(G.dev, G.pipe_dn_dp4a_mm, NULL);
         vkDestroyPipelineLayout(G.dev, G.plyt_dn4, NULL);
         vkDestroyDescriptorSetLayout(G.dev, G.dsl_dn4, NULL);
     }
     if (G.shader_qr) vkDestroyShaderModule(G.dev, G.shader_qr, NULL);
     if (G.shader_gu_dp4a) vkDestroyShaderModule(G.dev, G.shader_gu_dp4a, NULL);
     if (G.shader_dn_dp4a) vkDestroyShaderModule(G.dev, G.shader_dn_dp4a, NULL);
+    if (G.shader_gu_dp4a_mm) vkDestroyShaderModule(G.dev, G.shader_gu_dp4a_mm, NULL);
+    if (G.shader_dn_dp4a_mm) vkDestroyShaderModule(G.dev, G.shader_dn_dp4a_mm, NULL);
     if (G.shader_att) {
         vkDestroyDescriptorPool(G.dev, G.dpool_att, NULL);
         vkDestroyPipeline(G.dev, G.pipe_att, NULL);

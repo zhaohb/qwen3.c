@@ -92,6 +92,13 @@ int  coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const 
                                 ColiVkTensor *const *downs, const int *rows, int count,
                                 const float *x);
 int  coli_vk_expert_group_take(float *y);
+/* Prefill MUL_MAT_ID path (llama.cpp-style): upload xs[S,D] once, then issue groups
+ * that GPU-gather rows via tok_ids[sum(rows)] into packed eg_x — no host xg pack. */
+int  coli_vk_eg_gather_available(void);
+int  coli_vk_eg_xs_bind(const float *xs, int S, int D);
+int  coli_vk_expert_group_issue_id(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                   ColiVkTensor *const *downs, const int *rows, int count,
+                                   const int *tok_ids);
 
 /* Upload a resident tensor without computing (expert tier: gate/up/down uploaded once,
  * then driven by coli_vk_expert_group). Returns 0 on failure/unsupported fmt. */

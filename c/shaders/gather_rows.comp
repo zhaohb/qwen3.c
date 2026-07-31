@@ -1,0 +1,22 @@
+#version 450
+// MUL_MAT_ID-style compact (llama.cpp Vulkan idea): keep xs[S,D] once and gather
+// into packed expert_group rows via tok_ids[r] → out[r,:] = xs[tok_ids[r],:].
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer XS  { float xs[]; };
+layout(std430, binding = 1) readonly  buffer IDS { int tok_ids[]; };
+layout(std430, binding = 2) writeonly buffer OUT { float outp[]; };
+
+layout(push_constant) uniform PC { int total, D, S; } p;
+
+void main() {
+    int row = int(gl_WorkGroupID.y);
+    int d = int(gl_GlobalInvocationID.x);
+    if (row >= p.total || d >= p.D) return;
+    int src = tok_ids[row];
+    if (src < 0 || src >= p.S) {
+        outp[row * p.D + d] = 0.0;
+        return;
+    }
+    outp[row * p.D + d] = xs[src * p.D + d];
+}

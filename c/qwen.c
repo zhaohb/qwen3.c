@@ -1098,8 +1098,8 @@ static void moe_batch_from_logits(Model *m, Layer *l, int layer, const float *xs
 
     int cpu_i = 0;
 #ifdef COLI_VULKAN
-    /* GPU chunks, each one submit: pack the chunk's rows, issue, spend the flight on the
-     * CPU experts (moe_token's issue -> CPU share -> take, spread over the chunks), join. */
+    /* GPU chunks: prefer MUL_MAT_ID gather (xs once + tok_ids) over host xg pack. */
+    int use_id = coli_vk_eg_gather_available() && coli_vk_eg_xs_bind(xs, S, D);
     int nchunk = (ngpu + MOEB_MAXE - 1) / MOEB_MAXE, per = nchunk ? (ncpu + nchunk - 1) / nchunk : 0;
     for (int gi = 0, roff = 0; gi < ngpu; ) {
         ColiVkTensor *vg[MOEB_MAXE], *vu[MOEB_MAXE], *vd[MOEB_MAXE];
@@ -1115,14 +1115,21 @@ static void moe_batch_from_logits(Model *m, Layer *l, int layer, const float *xs
             roff += nr;
             if (roff == moeb_rows(&b, e)) { gi++; roff = 0; }
         }
-        float *xg = falloc((int64_t)total*D), *yg = falloc((int64_t)total*D);
+        float *yg = falloc((int64_t)total*D);
         int *rtok = ialloc(total); float *rw = falloc(total);
         for (int j = 0, p = 0; j < ng; j++)
-            for (int r = 0; r < rows[j]; r++, p++) {
+            for (int r = 0; r < rows[j]; r++, p++)
                 moeb_row(&b, jid[j], jbeg[j] + r, &rtok[p], &rw[p]);
+        int issued = 0;
+        if (use_id) {
+            issued = coli_vk_expert_group_issue_id(vg, vu, vd, rows, ng, rtok);
+        } else {
+            float *xg = falloc((int64_t)total*D);
+            for (int p = 0; p < total; p++)
                 memcpy(xg + (int64_t)p*D, xs + (int64_t)rtok[p]*D, D*sizeof(float));
-            }
-        int issued = coli_vk_expert_group_issue(vg, vu, vd, rows, ng, xg);
+            issued = coli_vk_expert_group_issue(vg, vu, vd, rows, ng, xg);
+            free(xg);
+        }
         for (int k = 0; k < per && cpu_i < ncpu; k++, cpu_i++)
             moeb_cpu(&b, cpu[cpu_i], 0, moeb_rows(&b, cpu[cpu_i]));
         if (issued && coli_vk_expert_group_take(yg)) {
@@ -1131,25 +1138,46 @@ static void moe_batch_from_logits(Model *m, Layer *l, int layer, const float *xs
             if (issued) fprintf(stderr, "[VK] expert group failed mid-flight — recomputing on CPU\n");
             for (int j = 0; j < ng; j++) moeb_cpu(&b, jid[j], jbeg[j], rows[j]);
         }
-        free(xg); free(yg); free(rtok); free(rw);
+        free(yg); free(rtok); free(rw);
     }
 #endif
     for (; cpu_i < ncpu; cpu_i++) moeb_cpu(&b, cpu[cpu_i], 0, moeb_rows(&b, cpu[cpu_i]));
 
-    /* shared expert over all S rows at once: three submits for the whole batch instead
-     * of three per token, and its own weights stream once */
+    /* Shared expert over all S rows. Prefer one expert_group (fused silu*up+down,
+     * hidden stays on-device, DP4A when rows>1) — same idea as moe_token's fold-in.
+     * Fallback: three dense submits + host silu (weights still stream once). */
     {
-        int SI = c->sh_inter;
-        float *g = falloc((int64_t)S*SI), *u = falloc((int64_t)S*SI), *sh = falloc((int64_t)S*D);
-        mm_dense2(&l->gsg, l->sh_g, g, SI, &l->gsu, l->sh_u, u, SI, xs, S, D);
-        for (int64_t i = 0; i < (int64_t)S*SI; i++) g[i] = siluf_(g[i]) * u[i];
-        mm_dense(&l->gsd, l->sh_d, sh, g, S, SI, D);
-        for (int s = 0; s < S; s++) {
-            const float *x = xs + (int64_t)s*D; float gt = 0;
-            for (int d = 0; d < D; d++) gt += l->sh_gate[d] * x[d];
-            moeb_add(&b, s, sigmoidf_(gt), sh + (int64_t)s*D);
+        int SI = c->sh_inter, sh_done = 0;
+#ifdef COLI_VULKAN
+        if (l->gsg.t && l->gsu.t && l->gsd.t && SI == I && S <= MOEB_MAXROWS &&
+            l->gsg.fmt == c->expert_fmt) {
+            ColiVkTensor *vg[1] = {l->gsg.t}, *vu[1] = {l->gsu.t}, *vd[1] = {l->gsd.t};
+            int rows[1] = {S};
+            float *yg = falloc((int64_t)S * D);
+            if (coli_vk_expert_group_issue(vg, vu, vd, rows, 1, xs) &&
+                coli_vk_expert_group_take(yg)) {
+                for (int s = 0; s < S; s++) {
+                    const float *x = xs + (int64_t)s * D; float gt = 0;
+                    for (int d = 0; d < D; d++) gt += l->sh_gate[d] * x[d];
+                    moeb_add(&b, s, sigmoidf_(gt), yg + (int64_t)s * D);
+                }
+                sh_done = 1;
+            }
+            free(yg);
         }
-        free(g); free(u); free(sh);
+#endif
+        if (!sh_done) {
+            float *g = falloc((int64_t)S*SI), *u = falloc((int64_t)S*SI), *sh = falloc((int64_t)S*D);
+            mm_dense2(&l->gsg, l->sh_g, g, SI, &l->gsu, l->sh_u, u, SI, xs, S, D);
+            for (int64_t i = 0; i < (int64_t)S*SI; i++) g[i] = siluf_(g[i]) * u[i];
+            mm_dense(&l->gsd, l->sh_d, sh, g, S, SI, D);
+            for (int s = 0; s < S; s++) {
+                const float *x = xs + (int64_t)s*D; float gt = 0;
+                for (int d = 0; d < D; d++) gt += l->sh_gate[d] * x[d];
+                moeb_add(&b, s, sigmoidf_(gt), sh + (int64_t)s*D);
+            }
+            free(g); free(u); free(sh);
+        }
     }
     free(tidx); free(tval); free(ecnt); free(ecur); free(epair); free(gpu); free(cpu);
 }
@@ -1322,23 +1350,23 @@ static void decode_stack(Model *m, const int *ids, int S, int pos_base, float *l
             kvi++;
         } else {
 #ifdef COLI_VULKAN
-            /* Prefill: chunked GDN on one CB per up-to-64 tokens (fewer fences). */
+            /* Prefill: batched a/b + chunked GDN (batched qkv/z/out, serial conv+delta). */
             int gdn_seq = 0;
             if (S > 1 && m->vk_gdn_full_on && l->gqkv.t && l->gz.t && l->gout.t) {
                 int VH = c->gdn_vh, VD = c->gdn_vd, prs = 2 * VH + VD;
                 float *params = falloc((int64_t)S * prs);
-                float b[64], a[64];
+                float *ab = falloc((int64_t)S * VH), *bb = falloc((int64_t)S * VH);
+                mm_dense2(&l->gbb, l->b, bb, VH, &l->gba, l->a, ab, VH, nrm, S, D);
                 for (int s = 0; s < S; s++) {
-                    const float *xs = nrm + (int64_t)s * D;
                     float *ps = params + (int64_t)s * prs;
-                    matmul(b, xs, l->b, 1, D, VH);
-                    matmul(a, xs, l->a, 1, D, VH);
+                    const float *as = ab + (int64_t)s * VH, *bs = bb + (int64_t)s * VH;
                     for (int h = 0; h < VH; h++) {
-                        ps[h]      = expf(-expf(l->alog[h]) * softplusf_(a[h] + l->dtb[h]));
-                        ps[VH + h] = sigmoidf_(b[h]);
+                        ps[h]      = expf(-expf(l->alog[h]) * softplusf_(as[h] + l->dtb[h]));
+                        ps[VH + h] = sigmoidf_(bs[h]);
                     }
                     memcpy(ps + 2 * VH, l->gnorm, VD * sizeof(float));
                 }
+                free(ab); free(bb);
                 gdn_seq = coli_vk_gdn_full_seq(gi, nrm, S, D, l->gqkv.t, l->gz.t, params,
                                                l->gout.t, tmp, c->gdn_kh, c->gdn_kd, VH, VD,
                                                c->conv_dim, c->conv_k, c->eps, D);

@@ -1,0 +1,66 @@
+#version 450
+// Prefill multi-row DP4A down-proj — BM rows share each weight row (see gate_up_mm).
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_integer_dot_product : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer HQ { uint hq[]; };
+layout(std430, binding = 1) readonly  buffer HS { float hs[]; };
+layout(std430, binding = 2) readonly  buffer W  { uint w[]; };
+layout(std430, binding = 3) readonly  buffer SC { float sc[]; };
+layout(std430, binding = 4) writeonly buffer Y  { float y[]; };
+
+layout(push_constant) uniform P { int S, I, O, rowWords, gs, sbase; } p;
+
+#define BM 8
+shared uint xsh[4096];
+
+int pkn(uint v) {
+    return int((v & 0xfu) | (((v >> 4) & 0xfu) << 8) | (((v >> 8) & 0xfu) << 16) | (((v >> 12) & 0xfu) << 24));
+}
+
+void main() {
+    int s0 = int(gl_WorkGroupID.y) * BM;
+    int n = p.S - s0; if (n > BM) n = BM;
+    if (n <= 0) return;
+    int tid = int(gl_LocalInvocationID.x), xwords = (p.I + 3) / 4;
+    if (n * xwords > 4096) return;
+
+    for (int bi = 0; bi < n; bi++) {
+        int row = p.sbase + s0 + bi;
+        for (int i = tid; i < xwords; i += 256)
+            xsh[bi * xwords + i] = hq[row * xwords + i];
+    }
+    barrier();
+
+    int lane = int(gl_SubgroupInvocationID), sgsize = int(gl_SubgroupSize);
+    int sg = int(gl_SubgroupID), nsg = 256 / sgsize, stride = int(gl_NumWorkGroups.x) * nsg;
+    int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+    const int ONES = 0x01010101;
+    float xscale[BM];
+    for (int bi = 0; bi < n; bi++) xscale[bi] = hs[p.sbase + s0 + bi];
+
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
+        uint rb = uint(o) * uint(p.rowWords), sb = uint(o) * uint(ng) * 2u;
+        float acc[BM];
+        for (int bi = 0; bi < BM; bi++) acc[bi] = 0.0;
+
+        for (int wi = lane; wi < words; wi += sgsize) {
+            uint b = w[rb + uint(wi)];
+            int pk0 = pkn(b), pk1 = pkn(b >> 16);
+            uint grp = uint(wi * 8 / p.gs) * 2u;
+            float sc_ = sc[sb + grp], z = sc[sb + grp + 1u];
+            for (int bi = 0; bi < n; bi++) {
+                uint xu0 = xsh[bi * xwords + 2 * wi];
+                uint xu1 = xsh[bi * xwords + 2 * wi + 1];
+                int awn = dotPacked4x8EXT(int(xu0), pk0) + dotPacked4x8EXT(int(xu1), pk1);
+                int ax  = dotPacked4x8EXT(int(xu0), ONES) + dotPacked4x8EXT(int(xu1), ONES);
+                acc[bi] += sc_ * (float(awn) - z * float(ax));
+            }
+        }
+        for (int bi = 0; bi < n; bi++) {
+            float tot = subgroupAdd(acc[bi]);
+            if (lane == 0) y[(s0 + bi) * p.O + o] = tot * xscale[bi];
+        }
+    }
+}

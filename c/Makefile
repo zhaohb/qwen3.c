@@ -35,12 +35,13 @@ VK_SPV    =
 GLSLC    ?= glslc
 GV       ?= glslangValidator
 
-SPV_LIST = qmatmul qmatmul_gate_up \
+SPV_LIST = qmatmul qmatmul_mm qmatmul_gate_up \
            rmsnorm gdn_delta gqa_attn rmsnorm_zc rope_partial conv1d \
            gdn_conv gdn_delta_cv gqa_qkv \
            qmatmul_dp4a qmatmul_gate_up_dp4a quant_rows qmatmul_down_dp4a \
+           qmatmul_gate_up_dp4a_mm qmatmul_down_dp4a_mm \
            argmax residual_rmsnorm_zc \
-           replicate_rows moe_accumulate gdn_pack_params \
+           replicate_rows gather_rows moe_accumulate gdn_pack_params \
            softmax_topk moe_indexed moe_pack_w
 
 ifeq ($(VK),1)

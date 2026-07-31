@@ -186,6 +186,15 @@ static struct {
     int eg_pipe_cmd_ready, eg_pipe_n, eg_pipe_D, eg_pipe_I, eg_pipe_fmt, eg_pipe_dfmt;
     int eg_pipe_dp4a, eg_pipe_dp4a_dn, eg_pipe_grw, eg_pipe_ggs, eg_pipe_drw, eg_pipe_dgs;
     int eg_pipe_cache_on, eg_pipe_hits, eg_pipe_misses;
+    /* GDN route CB cache (Phase 1): GDN pipe push-constants are shape-stable across
+     * tokens (no pos/T), so after the first record per (pp_slot, ln_layer) we
+     * resubmit the same CB. Expert weights stay live via UPDATE_AFTER_BIND. */
+    int route_gdn_ready[2][VK_KV_LAYERS];
+    int route_gdn_fused[2][VK_KV_LAYERS];
+    VkBuffer route_gdn_key_stream, route_gdn_key_x, route_gdn_key_idx;
+    int route_cache_hits, route_cache_misses;
+    /* Device-resident final RMSNorm weight for stream→norm→lm_head argmax fuse. */
+    VkBuffer final_nw; VkDeviceMemory final_nwm; void *final_nwp; int final_nD;
     VkBuffer eg_pipe_xb, eg_pipe_hb, eg_pipe_yb, eg_pipe_wb, eg_pipe_sb, eg_pipe_nb;
     VkBuffer eg_pipe_xqb, eg_pipe_xsb, eg_pipe_hqb, eg_pipe_hsb;
     VkBuffer eg_cache_gw[64], eg_cache_gs[64], eg_cache_uw[64], eg_cache_us[64];
@@ -536,7 +545,10 @@ static void derive_sibling(const char *spv, const char *suffix, char *out, size_
 }
 /* "…/qmatmul.spv" -> "…/attention_absorb.spv" (same directory). */
 static void derive_dir_file(const char *spv, const char *fname, char *out, size_t n) {
+    /* Accept both POSIX and Windows separators (MinGW argv often uses '\'). */
     const char *sl = strrchr(spv, '/');
+    const char *bs = strrchr(spv, '\\');
+    if (bs && (!sl || bs > sl)) sl = bs;
     size_t pre = sl ? (size_t)(sl - spv) + 1 : 0;
     if (pre + strlen(fname) + 1 < n) { memcpy(out, spv, pre); strcpy(out + pre, fname); }
     else snprintf(out, n, "%s", fname);
@@ -865,6 +877,14 @@ int coli_vk_init(const char *spv_path) {
     G.eg_sem_armed = 0; G.stream_live = 0; G.stream_D = 0;
     G.eg_pipe_cmd_ready = 0; G.eg_pipe_hits = 0; G.eg_pipe_misses = 0;
     G.eg_pipe_cache_on = g_qwen_opts.eg_cache != 0;
+    memset(G.route_gdn_ready, 0, sizeof(G.route_gdn_ready));
+    memset(G.route_gdn_fused, 0, sizeof(G.route_gdn_fused));
+    G.route_gdn_key_stream = VK_NULL_HANDLE;
+    G.route_gdn_key_x = VK_NULL_HANDLE;
+    G.route_gdn_key_idx = VK_NULL_HANDLE;
+    G.route_cache_hits = 0; G.route_cache_misses = 0;
+    G.final_nw = VK_NULL_HANDLE; G.final_nwm = VK_NULL_HANDLE;
+    G.final_nwp = NULL; G.final_nD = 0;
 
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
@@ -2254,11 +2274,12 @@ int coli_vk_stream_begin(const float *x, int D) {
 }
 
 int coli_vk_stream_end(float *x, int D) {
-    if (!G.stream_live || !x || D != G.stream_D) return 0;
+    if (!G.stream_live || D != G.stream_D) return 0;
     if (!pp_drain_all()) return 0;
     if (!stream_wait_eg()) return 0;
     if (!stream_drain_sem()) return 0;
-    memcpy(x, G.stream.ptr, (size_t)D * 4);
+    /* x==NULL: drain only and keep resid on device for stream_norm_argmax. */
+    if (x) memcpy(x, G.stream.ptr, (size_t)D * 4);
     G.stream_live = 0;
     G.cmd_rec = G.cmd; G.pp_rec = 0;
     if (G.eg_pipe_cache_on && (G.eg_pipe_hits + G.eg_pipe_misses) > 0) {
@@ -2273,11 +2294,112 @@ int coli_vk_stream_end(float *x, int D) {
     return 1;
 }
 
+/* Print once from the engine after a generate run (--eg-stats). */
+void coli_vk_route_cache_stats(void) {
+    int tot = G.route_cache_hits + G.route_cache_misses;
+    if (!tot) return;
+    fprintf(stderr, "[VK] route_gdn CB cache: hits=%d misses=%d (%.1f%% hit)\n",
+            G.route_cache_hits, G.route_cache_misses,
+            100.0 * G.route_cache_hits / tot);
+}
+
 int coli_vk_stream_add(const float *y, int D) {
     if (!G.stream_live || !y || D != G.stream_D) return 0;
     if (!stream_wait_eg()) return 0;   /* resid must be idle before host touches it */
     float *r = (float *)G.stream.ptr;
     for (int d = 0; d < D; d++) r[d] += y[d];
+    return 1;
+}
+
+int coli_vk_stream_copy_resid(float *x, int D) {
+    if (!x || !G.stream.ptr || D != G.stream_D || D < 1) return 0;
+    memcpy(x, G.stream.ptr, (size_t)D * 4);
+    return 1;
+}
+
+/* Upload model.norm.weight once for the stream→norm→argmax fuse. */
+int coli_vk_final_norm_weight(const float *w, int D) {
+    if (!G.ready || !w || D < 1 || !G.pipe_nrmz) return 0;
+    size_t bytes = (size_t)D * 4;
+    if (!G.final_nw || G.final_nD != D) {
+        if (G.final_nw) {
+            vkDestroyBuffer(G.dev, G.final_nw, NULL);
+            vkFreeMemory(G.dev, G.final_nwm, NULL);
+            G.final_nw = VK_NULL_HANDLE; G.final_nwp = NULL;
+        }
+        float p0 = G.prio; G.prio = 1.0f;
+        int ok = alloc_hostvis(bytes, &G.final_nw, &G.final_nwm, &G.final_nwp);
+        G.prio = p0;
+        if (!ok) return 0;
+        G.final_nD = D;
+    }
+    memcpy(G.final_nwp, w, bytes);
+    return 1;
+}
+
+/* After coli_vk_stream_end(NULL, D): resid stays in G.stream. Run final RMSNorm +
+ * lm_head + device argmax in ONE submit; only the winning token id is read back. */
+int coli_vk_stream_norm_argmax(ColiVkTensor **tensor, const void *weights, const float *scales,
+                               int fmt, int I, int O, int gs, float eps, int *idx, float *val) {
+    if (!G.ready || !G.pipe_am || !G.pipe_nrmz || !G.final_nw || G.final_nD != I ||
+        !G.stream.buf || G.stream_D != I || O < 1 || !idx) return 0;
+    if (!upload_tensor(tensor, weights, scales, fmt, I, O, gs)) return 0;
+    ColiVkTensor *t = *tensor;
+    size_t pb = AM_GRP * 4 < 256 ? 256 : AM_GRP * 4;
+    if (!scratch_reserve(&G.x, (size_t)I * 4) ||
+        !scratch_reserve(&G.am_y, (size_t)O * 4) ||
+        !scratch_reserve_mt(&G.am_pi, pb, G.memtype_cached) ||
+        !scratch_reserve_mt(&G.am_pv, pb, G.memtype_cached)) return 0;
+
+    VkDescriptorBufferInfo bn[3] = {
+        {.buffer = G.stream.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.final_nw, .range = VK_WHOLE_SIZE},
+        {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}};
+    wr_desc(G.dset_nrm, 3, bn);
+    VkDescriptorBufferInfo mi[4] = {
+        {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = t->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.am_y.buf, .range = VK_WHOLE_SIZE}};
+    VkDescriptorBufferInfo ai[3] = {
+        {.buffer = G.am_y.buf, .range = VK_WHOLE_SIZE}, {.buffer = G.am_pi.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.am_pv.buf, .range = VK_WHOLE_SIZE}};
+    wr_desc(G.dset, 4, mi);
+    wr_desc(G.dset_am, 3, ai);
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrmz);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_nrm, 0, 1, &G.dset_nrm, 0, NULL);
+    struct PCN pin = {1, I, eps};
+    vkCmdPushConstants(G.cmd, G.plyt_nrm, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pin), &pin);
+    vkCmdDispatch(G.cmd, 1, 1, 1);
+    vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
+    struct PC pc = {fmt, 1, I, O, t->rowWords, t->gs};
+    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), 1, 1);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_am);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_am, 0, 1, &G.dset_am, 0, NULL);
+    for (int stage = 0; stage < 2; stage++) {
+        vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        struct PCAm am = {O, stage, AM_GRP};
+        vkCmdPushConstants(G.cmd, G.plyt_am, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(am), &am);
+        vkCmdDispatch(G.cmd, stage == 0 ? (uint32_t)AM_GRP : 1u, 1, 1);
+    }
+    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    G.cmd_ready = 0; G.bound_tensor = NULL;
+    if (vk_fence_wait_loud(G.fence, "stream_norm_argmax") != VK_SUCCESS) { G.ready = 0; return 0; }
+    *idx = (int)((const uint32_t *)G.am_pi.ptr)[0];
+    if (val) *val = ((const float *)G.am_pv.ptr)[0];
     return 1;
 }
 
@@ -2916,6 +3038,11 @@ int coli_vk_gdn_full_route_pipe(int layer, int D,
         if (G.pp_rec) { pp_pop_sets(); G.pp_rec = 0; G.pp_layer[G.pp_slot] = -1; }
         return 0;
     }
+
+    /* NOTE: do NOT cache/resubmit GDN route CBs across layers. With moe_ix ping-pong
+     * only cmd_pp[0|1] exist; even layers share slot 0 and overwrite each other's
+     * recorded CB. A (slot,layer) ready bit would then resubmit the wrong layer's
+     * work (garbled decode). Re-record every call. */
 
     /* in_ln(stream) -> G.x; b/a from G.x; pack params; then GDN full + route tail */
     VkDescriptorBufferInfo bin[3] = {
@@ -3681,6 +3808,10 @@ void coli_vk_shutdown(void) {
         if (!G.qln_in[i]) continue;
         vkDestroyBuffer(G.dev, G.qln_in[i], NULL); vkFreeMemory(G.dev, G.qln_inm[i], NULL);
         vkDestroyBuffer(G.dev, G.qln_post[i], NULL); vkFreeMemory(G.dev, G.qln_postm[i], NULL);
+    }
+    if (G.final_nw) {
+        vkDestroyBuffer(G.dev, G.final_nw, NULL); vkFreeMemory(G.dev, G.final_nwm, NULL);
+        G.final_nw = VK_NULL_HANDLE; G.final_nwp = NULL; G.final_nD = 0;
     }
     for (int i = 0; i < VK_KV_LAYERS; i++) {
         if (!G.gdn_alog[i]) continue;

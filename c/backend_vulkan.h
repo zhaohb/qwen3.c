@@ -198,9 +198,18 @@ int  coli_vk_gdn_full_route(int layer, const float *x_in, const float *resid, in
  * in_ln + b/a + decay/beta pack onto the GPU. */
 int  coli_vk_stream_available(void);
 int  coli_vk_stream_begin(const float *x, int D);
+/* Drain in-flight work. If x!=NULL copy resid back; if x==NULL keep resid on device
+ * for coli_vk_stream_norm_argmax (Phase 1: skip host final-norm round-trip). */
 int  coli_vk_stream_end(float *x, int D);
 int  coli_vk_stream_add(const float *y, int D);          /* host CPU-expert delta into stream */
 const float *coli_vk_stream_nrm(void);                   /* last route's nrm (host-cached) */
+int  coli_vk_final_norm_weight(const float *w, int D);
+/* stream_end(NULL) then this: final RMSNorm + lm_head + argmax, only idx read back. */
+int  coli_vk_stream_norm_argmax(ColiVkTensor **tensor, const void *weights, const float *scales,
+                                int fmt, int I, int O, int gs, float eps, int *idx, float *val);
+/* Copy post-stream_end resid from the device-mapped stream buffer (fallback path). */
+int  coli_vk_stream_copy_resid(float *x, int D);
+void coli_vk_route_cache_stats(void);
 int  coli_vk_gdn_ba_weight(int layer, const float *alog, const float *dtb,
                            const float *gnorm, int VH, int VD);
 int  coli_vk_gqa_full_route_pipe(int layer, int D,

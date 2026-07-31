@@ -152,6 +152,10 @@ typedef struct {
     int vk_gqa_full_on;            /* whole GQA block fused (q/k/v matmul+norm+rope+attn+oproj, one submit) */
     int vk_route_on;               /* in/post RMSNorm + router fused into the attn/GDN full submit */
     int vk_stream_on;              /* P0/P1/P2: device resid stream + eg→route semaphore */
+    int vk_stream_argmax;          /* stream path left resid on device for norm+argmax fuse */
+    /* Persistent decode scratch (Phase 1): avoid per-token malloc in the hot path. */
+    float *scratch_x, *scratch_nrm, *scratch_tmp, *scratch_last;
+    int scratch_cap;               /* floats per buffer (= hidden when allocated) */
 #endif
 } Model;
 
@@ -1156,13 +1160,36 @@ static void dump_logits(Model *m, const float *logit) {
     if (g_logits_f) fwrite(logit, sizeof(float), m->c.vocab, g_logits_f);
 }
 
+#ifdef COLI_VULKAN
+/* Grow persistent decode scratch to at least `need` floats per buffer. */
+static void scratch_ensure(Model *m, int need) {
+    if (m->scratch_cap >= need) return;
+    free(m->scratch_x); free(m->scratch_nrm); free(m->scratch_tmp); free(m->scratch_last);
+    m->scratch_x = falloc(need); m->scratch_nrm = falloc(need);
+    m->scratch_tmp = falloc(need); m->scratch_last = falloc(need);
+    m->scratch_cap = need;
+}
+#endif
+
 /* Runs the decoder stack over S new tokens and leaves the final-normed hidden state of
- * the LAST token in last[hidden] — the shared body of step() and step_top1(). */
+ * the LAST token in last[hidden] — the shared body of step() and step_top1().
+ * Stream+greedy path may leave resid on device (m->vk_stream_argmax) and skip filling last. */
 static void decode_stack(Model *m, const int *ids, int S, int pos_base, float *last) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts;
+#ifdef COLI_VULKAN
+    m->vk_stream_argmax = 0;
+    float *x, *nrm, *tmp;
+    if (S == 1) {
+        scratch_ensure(m, D);
+        x = m->scratch_x; nrm = m->scratch_nrm; tmp = m->scratch_tmp;
+    } else {
+        x = falloc((int64_t)S*D); nrm = falloc((int64_t)S*D); tmp = falloc((int64_t)S*D);
+    }
+#else
     float *x = falloc((int64_t)S*D);
-    for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+#endif
+    for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     int kvi = 0, gi = 0;
 #ifdef COLI_VULKAN
     /* Decode stream path (S=1): resid stays on device; only pr[E] comes back for top-k. */
@@ -1214,7 +1241,8 @@ static void decode_stack(Model *m, const int *ids, int S, int pos_base, float *l
             } else
                 moe_from_topk_pipe(m, l, i, idx, val);
         }
-        coli_vk_stream_end(x, D);
+        /* Prefer device final-norm+argmax: drain without host resid copy. */
+        coli_vk_stream_end(NULL, D);
         if (coli_vk_stream_ix_pending()) {
             for (int i = 0; i < c->n_layers; i++) {
                 int hidx[64];
@@ -1223,7 +1251,10 @@ static void decode_stack(Model *m, const int *ids, int S, int pos_base, float *l
                     m->eusage[(size_t)i * E + hidx[kk]]++;
             }
         }
-        goto stack_done;
+        m->vk_stream_argmax = 1;
+        m->token_count += S;
+        /* scratch owned by Model — do not free */
+        return;
     }
 #endif
     for (int i = 0; i < c->n_layers; i++) {
@@ -1300,13 +1331,26 @@ stack_done:
 #endif
     m->token_count += S;
     rmsnorm_zc(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
+#ifdef COLI_VULKAN
+    if (S != 1) { free(x); free(nrm); free(tmp); }
+#else
     free(x); free(nrm); free(tmp);
+#endif
 }
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c;
     float *last = falloc(c->hidden);
     decode_stack(m, ids, S, pos_base, last);
+#ifdef COLI_VULKAN
+    /* Stream greedy path skipped host final-norm; materialize for logit consumers. */
+    if (m->vk_stream_argmax) {
+        m->vk_stream_argmax = 0;
+        if (!coli_vk_stream_copy_resid(last, c->hidden))
+            memset(last, 0, (size_t)c->hidden * sizeof(float));
+        rmsnorm_zc(last, last, m->final_norm, c->hidden, c->eps);
+    }
+#endif
     float *logit = falloc(c->vocab);
     mm_dense(&m->glmh, m->lm_head, logit, last, 1, c->hidden, c->vocab);
     free(last);
@@ -1319,22 +1363,51 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
  * device argmax is unavailable — or when logits are being dumped and we need them all. */
 static int step_top1(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
+#ifdef COLI_VULKAN
+    float *last;
+    if (S == 1) { scratch_ensure(m, D); last = m->scratch_last; }
+    else last = falloc(D);
+#else
     float *last = falloc(D);
+#endif
     decode_stack(m, ids, S, pos_base, last);
 #ifdef COLI_VULKAN
     if (!g_logits_f && m->glmh.t) {
         int idx;
-        if (coli_vk_matmul_argmax(&m->glmh.t, m->glmh.q, m->glmh.s, m->glmh.fmt,
-                                  D, c->vocab, m->glmh.gs, last, &idx, NULL)) {
-            free(last);
+        /* Phase 1: final RMSNorm + lm_head + argmax fused; resid never leaves GPU. */
+        if (m->vk_stream_argmax &&
+            coli_vk_stream_norm_argmax(&m->glmh.t, m->glmh.q, m->glmh.s, m->glmh.fmt,
+                                       D, c->vocab, m->glmh.gs, c->eps, &idx, NULL)) {
+            m->vk_stream_argmax = 0;
             return idx;
         }
+        if (m->vk_stream_argmax) {
+            /* Device fuse failed — materialize resid + CPU final-norm into last. */
+            if (!coli_vk_stream_copy_resid(last, D))
+                memset(last, 0, (size_t)D * sizeof(float));
+            rmsnorm_zc(last, last, m->final_norm, D, c->eps);
+            m->vk_stream_argmax = 0;
+        }
+        if (coli_vk_matmul_argmax(&m->glmh.t, m->glmh.q, m->glmh.s, m->glmh.fmt,
+                                  D, c->vocab, m->glmh.gs, last, &idx, NULL)) {
+            if (S != 1) free(last);
+            return idx;
+        }
+    } else if (m->vk_stream_argmax) {
+        if (!coli_vk_stream_copy_resid(last, D))
+            memset(last, 0, (size_t)D * sizeof(float));
+        rmsnorm_zc(last, last, m->final_norm, D, c->eps);
+        m->vk_stream_argmax = 0;
     }
 #endif
     /* the stack already advanced the KV/GDN state, so finish from the same hidden state */
     float *logit = falloc(c->vocab);
     mm_dense(&m->glmh, m->lm_head, logit, last, 1, D, c->vocab);
+#ifdef COLI_VULKAN
+    if (S != 1) free(last);
+#else
     free(last);
+#endif
     dump_logits(m, logit);
     int best = 0; float bv = logit[0];
     for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
@@ -1516,7 +1589,7 @@ static int generate_text(Model *m, Tok *T, const int *prompt, int np, int n_new,
         int is_stop = 0;
         for (int k = 0; k < n_stop; k++) if (best == stop_ids[k]) { is_stop = 1; break; }
         if (is_stop) break;
-        /* stream printable tokens; skip control specials (im_start/im_end/...) */
+        /* Detokenize outside decode timing (Phase 1.4); fflush once per token is fine. */
         if (best >= 0 && best < T->n_ids && !T->id_special[best]) {
             char dec[256]; int dn = tok_decode(T, &best, 1, dec, (int)sizeof(dec) - 1);
             if (dn > 0) { fwrite(dec, 1, (size_t)dn, stdout); fflush(stdout); }
@@ -1737,6 +1810,8 @@ static void vk_dense_init(Model *m) {
         if (m->lm_head != m->embed) { free(m->lm_head); m->lm_head = NULL; }  /* tied: embed stays */
         bytes += coli_vk_tensor_bytes(m->glmh.t); nt++;
     }
+    if (m->final_norm && coli_vk_final_norm_weight(m->final_norm, c->hidden))
+        printf("[VK] final RMSNorm weight resident (stream→argmax fuse)\n");
     if (nt) printf("[VK] dense offload: %d tensors quantized + resident (%.2f GB VRAM, %.1fs) — f32 originals freed\n",
                    nt, bytes / 1e9, now_s() - t0);
 }
@@ -1799,6 +1874,7 @@ static int run_text_mode(Model *m, const char *snap, const char *user, int ngen)
            tot ? 100.0 * m->hits / tot : 0.0,
            (unsigned long long)m->hits, (unsigned long long)m->miss);
 #ifdef COLI_VULKAN
+    if (g_qwen_opts.eg_stats) coli_vk_route_cache_stats();
     { long tt = g_vk_srv + g_vk_unsrv;
       printf("[VK] routed experts: tier-served %ld (%.1f%%), CPU %ld\n",
              g_vk_srv, tt ? 100.0 * g_vk_srv / tt : 0.0, g_vk_unsrv); }
